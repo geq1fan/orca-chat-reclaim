@@ -200,8 +200,7 @@ test('reclaim asks for the focused workspace and reports the count before closin
           reclaimed.push(workspaceId)
           return {
             outcomes: [ok({ workspaceId, terminalId: 't1' })],
-            stoppedAtFailure: false,
-            skipped: null
+            stoppedAtFailure: false
           }
         }
       }
