@@ -1,5 +1,14 @@
 // `orca plugin test .` runs this in Node with the same runtime and checks Orca uses.
-import { afterEach, assert, hostError, mockHost, mount, test, type TestPanel } from 'orca/testing'
+import {
+  afterEach,
+  assert,
+  hostError,
+  mockHost,
+  mount,
+  test,
+  type TestPanel,
+  type TreeSnapshot
+} from 'orca/testing'
 import type { CloseOutcome, SessionRow, SessionSnapshot } from './protocol'
 import * as panel from './panel'
 
@@ -297,7 +306,7 @@ test('a done chat whose ids matched no process is 无法判定 and greyed', asyn
   assert.deepEqual(view.errors, [])
 })
 
-test('an id-less pairing reads 运行中（无会话 id）, and 无法判定 names its reason', async () => {
+test('an id-less pairing shows 无会话 id · pid N, and its note stays in the close tooltip', async () => {
   const idless: SessionSnapshot = {
     workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
     sessions: [
@@ -336,12 +345,114 @@ test('an id-less pairing reads 运行中（无会话 id）, and 无法判定 nam
     host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => idless } })
   })
 
-  assert.ok(view.find({ text: '运行中（无会话 id）' }))
-  assert.ok(view.find({ text: 'pid 8993' }))
-  assert.ok(view.find({ text: '无法判定：有 1 个工作区没读到，无法确认本机 claude 的会话总数，不配对' }))
+  assert.equal(view.find({ text: '运行中（无会话 id）' }), null)
+  assert.ok(view.find({ text: '无会话 id · pid 8993' }))
+  // Explanations moved into the close button's tooltip: the row keeps two lines for every agent.
+  assert.equal(view.find({ text: /antigravity 不提供会话 id/ }), null)
+  assert.equal(view.find({ text: /无法判定：有 1 个工作区没读到/ }), null)
+  assert.ok(
+    String(view.find({ role: 'button', text: '关闭' })?.props.tooltip).includes(
+      'antigravity 不提供会话 id'
+    )
+  )
   // The paired row is closeable; the unjudged one is not.
   assert.equal(view.find({ role: 'button', text: '关闭' })?.disabled, false)
   assert.equal(view.find({ role: 'button', text: '无法判定' })?.disabled, true)
+  assert.deepEqual(view.errors, [])
+})
+
+/** Text leaves of a drawn subtree, in reading order; blank leaves are not fields. */
+function treeLeaves(node: TreeSnapshot | string, out: string[] = []): string[] {
+  if (typeof node === 'string') {
+    if (node.trim() !== '') out.push(node.trim())
+    return out
+  }
+  for (const child of node.children ?? []) treeLeaves(child, out)
+  return out
+}
+
+/** The innermost drawn box that holds both the row's title and its close button. */
+function rowLeaves(view: TestPanel, title: string): string[] {
+  const tree = view.tree()
+  if (tree === null || typeof tree === 'string') return []
+  let found: TreeSnapshot | null = null
+  const visit = (node: TreeSnapshot): void => {
+    const text = treeLeaves(node).join(' ')
+    if (text.includes(title) && text.includes('关闭')) found = node
+    for (const child of node.children ?? []) {
+      if (typeof child !== 'string') visit(child)
+    }
+  }
+  visit(tree)
+  return found === null ? [] : treeLeaves(found)
+}
+
+test('an id row and an id-less row draw the same fields in the same order', async () => {
+  const both: SessionSnapshot = {
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
+    sessions: [
+      row({
+        workspaceId: 'folder:1',
+        workspaceName: '小小',
+        workspaceKind: 'folder',
+        terminalId: null,
+        title: '有 id 的 claude 行',
+        sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+        matchedId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+        pairing: 'id',
+        process: 'running'
+      }),
+      row({
+        workspaceId: 'folder:1',
+        workspaceName: '小小',
+        workspaceKind: 'folder',
+        terminalId: null,
+        title: '无 id 的 antigravity 行',
+        agent: 'antigravity',
+        sessionId: 'b9388fd5-6cae-42ad-9627-0aad35007921',
+        pairing: 'agent',
+        matchedPid: 8993,
+        matchedPgid: 8993,
+        process: 'running',
+        processNote:
+          'antigravity 不提供会话 id；本机这种会话 1 个、进程 1 个，1:1 配到 pid 8993（pgid 8993）'
+      })
+    ],
+    currentWorkspaceId: 'folder:1',
+    workspacesTruncated: false,
+    failedWorkspaces: 0,
+    recentOps: []
+  }
+  view = await mount(panel, {
+    host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => both } })
+  })
+
+  const withId = rowLeaves(view, '有 id 的 claude 行')
+  const withoutId = rowLeaves(view, '无 id 的 antigravity 行')
+  // Title / badge / agent / · / duration / · / handle / close button: the same slots, in the same
+  // order. A row that explained its 1:1 pairing inline would carry a ninth leaf.
+  const slots = (leaves: string[]): string[] =>
+    leaves.map((text, index) => {
+      if (index === 0) return 'title'
+      if (index === 1) return 'badge'
+      if (index === 2) return 'agent'
+      if (index === leaves.length - 1) return 'close'
+      if (text === '·') return 'separator'
+      if (text === '已空闲' || text === '状态持续') return 'duration'
+      return 'handle'
+    })
+  assert.equal(withId.length, 8)
+  assert.equal(withoutId.length, 8)
+  assert.deepEqual(slots(withId), slots(withoutId))
+  assert.equal(withId[6], '会话 39e65ad8')
+  assert.equal(withoutId[6], '无会话 id · pid 8993')
+  // The explanation moved into the close button's tooltip, not into another row line.
+  assert.equal(withoutId.some((text) => text.includes('1:1 配到')), false)
+  assert.ok(
+    String(view.findAll({ role: 'button', text: '关闭' })[1]?.props.tooltip).includes(
+      '1:1 配到 pid 8993'
+    )
+  )
   assert.deepEqual(view.errors, [])
 })
 
