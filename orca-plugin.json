@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "chat-reclaim",
   "name": "会话资源",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "按工作区列出 agent 会话，逐个或批量关闭空闲（done）会话，补上 Orca 资源面板缺失的关闭按钮。",
   "engines": {
     "orca": ">=1.4.259"
@@ -36,6 +36,13 @@
     },
     {
       "kind": "terminal:send"
+    }
+  ],
+  "screenshots": [
+    {
+      "path": "assets/screenshot.png",
+      "alt": "会话资源侧栏面板：顶部「当前工作区 · 空闲 1 个 · 可回收 0 个」，下面按工作区分组，小小分组展开显示 Home 与「未匹配到题目问题排查」两条运行中的 claude 会话，每行有状态徽章、状态持续时长、会话 id 和「关闭」按钮",
+      "caption": "按工作区列出运行中的 agent 会话，逐个或一键回收"
     }
   ]
 }
