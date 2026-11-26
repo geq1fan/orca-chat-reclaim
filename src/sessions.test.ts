@@ -11,8 +11,11 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     title: 'Claude',
     agent: 'claude',
     state: 'done',
+    stateKnown: true,
     stateStartedAt: 1000,
     sessionId: 'session-1',
+    orcaSessionId: null,
+    memoryBytes: null,
     process: null,
     matchedId: null,
     pairing: null,
@@ -23,28 +26,41 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
   }
 }
 
-test('selectIdle keeps finished sessions that have a terminal or a matched process', () => {
+test('selectIdle keeps finished sessions with known state that have a terminal or a matched process', () => {
   const sessions = [
     row({ terminalId: 'done-1', sessionId: null }),
     row({ terminalId: null, sessionId: 'chat-1', process: 'running', matchedId: 'chat-1' }),
+    // Even if sessionId is a file path (pi), having orcaSessionId lets it be closed.
+    row({
+      terminalId: null,
+      sessionId: '/tmp/pi.jsonl',
+      orcaSessionId: 'orca-pi-1',
+      process: 'running',
+      pairing: 'lease',
+      matchedPid: 901,
+      matchedPgid: 901
+    }),
     // Ids exist but none matched: not a licence to guess, and nothing to signal.
     row({ terminalId: null, sessionId: 'chat-unknown', process: 'unknown' }),
     row({ terminalId: null, sessionId: null, process: 'stopped' }),
     row({ terminalId: 'working-1', state: 'working' }),
     row({ terminalId: null, sessionId: 'working-chat', process: 'running', state: 'working' }),
+    // stateKnown: false must never be reclaimed even if state were done.
+    row({ terminalId: null, sessionId: 'mem-only', stateKnown: false, process: 'running' }),
     row({ terminalId: 'other-workspace', workspaceId: 'w2' })
   ]
   assert.deepEqual(
-    selectIdle(sessions, 'w1').map((session) => `${session.terminalId}/${session.sessionId}`),
-    ['done-1/null', 'null/chat-1']
+    selectIdle(sessions, 'w1').map((session) => `${session.terminalId}/${session.orcaSessionId ?? session.sessionId}`),
+    ['done-1/null', 'null/chat-1', 'null/orca-pi-1']
   )
   assert.deepEqual(selectIdle(sessions, 'w3'), [])
 })
 
-test('selectDone counts finished chats that have no terminal too', () => {
+test('selectDone counts finished chats with known state too and excludes stateKnown=false', () => {
   const sessions = [
     row({ terminalId: null, sessionId: 'chat-1', process: 'running' }),
     row({ terminalId: null, sessionId: 'chat-2', process: 'running', state: 'working' }),
+    row({ terminalId: null, sessionId: 'chat-3', process: 'running', state: 'done', stateKnown: false }),
     row({ terminalId: 'done-1' })
   ]
   assert.deepEqual(

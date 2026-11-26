@@ -25,7 +25,7 @@ import {
   type PanelContext,
   type Tone
 } from 'orca'
-import { AGENT_STATE_LABEL, truncateTitle } from './labels'
+import { AGENT_STATE_LABEL, formatMemory, isFilePath, truncateTitle } from './labels'
 import type { OpRecord, SessionRow, SessionSnapshot } from './protocol'
 import { groupSessions, isRunning, selectDone, selectIdle, type SessionGroup } from './sessions'
 
@@ -33,7 +33,7 @@ import { groupSessions, isRunning, selectDone, selectIdle, type SessionGroup } f
 const snapshot = atom<SessionSnapshot | null>('snapshot', null)
 const loading = atom<boolean>('loading', false)
 const loadError = atom<string | null>('loadError', null)
-/** The row a close request is running on (its session id); only one at a time. */
+/** The row a close request is running on (`rowKey`); only one at a time. */
 const busyKey = atom<string | null>('busyKey', null)
 /** The row showing 「确认关闭」. */
 const confirming = atom<string | null>('confirming', null)
@@ -57,13 +57,14 @@ function toggleGroup(workspaceId: string): void {
 type DisplayState = { label: string; tone: Tone }
 
 /**
- * The badge follows the process, not the agent's last reported state. A chat whose ids matched no
- * process is 「无法判定」, not 「未运行」: Orca can report a stale id, and only a session with no
- * candidate id at all is confirmed not to have a process.
+ * The badge follows the process and lease state first, then the agent's reported activity state.
+ * A session surfaced from `diagnostics.memory` whose `agents.list` idle state is unknown shows
+ * 「运行中」 rather than claiming `空闲`.
  */
 function displayState(row: SessionRow): DisplayState {
   if (row.process === 'stopped') return { label: '未运行', tone: 'neutral' }
   if (row.process === 'unknown') return { label: '无法判定', tone: 'warning' }
+  if (!row.stateKnown) return { label: '运行中', tone: 'accent' }
   if (row.state === 'working') return { label: '运行中', tone: 'accent' }
   if (row.state === 'blocked') return { label: '待确认', tone: 'warning' }
   if (row.state === 'waiting') return { label: '等待中', tone: 'neutral' }
@@ -71,18 +72,32 @@ function displayState(row: SessionRow): DisplayState {
 }
 
 /**
- * The row's handle, always in the same slot after the duration: the id its process answered to,
- * or 「无会话 id · pid N」 for an agent whose CLI carries no id and was paired 1:1 with a process.
- * A terminal row with no session id falls back to the terminal it addresses.
+ * The row's handle, always in the same slot after the duration: prefers canonical Orca `sessionId`
+ * (never slicing filesystem paths such as pi's `.jsonl` path), then appends memory usage or
+ * verified pid when present.
  */
 function identityLabel(row: SessionRow): string {
-  if (row.pairing !== 'agent') {
-    const id = row.matchedId ?? row.sessionId
-    if (id !== null) return `会话 ${id.slice(0, 8)}`
+  const candidates = [row.orcaSessionId, row.matchedId, row.sessionId]
+  const id = candidates.find((candidate): candidate is string => candidate !== null && !isFilePath(candidate))
+
+  let base: string
+  if (id !== undefined) {
+    base = `会话 ${id.slice(0, 8)}`
+  } else if (row.terminalId !== null) {
+    base = `终端 ${row.terminalId.slice(0, 8)}`
+  } else if (row.matchedPid !== null) {
+    base = `pid ${row.matchedPid}`
+  } else {
+    base = '无会话 id'
   }
-  if (row.matchedPid !== null) return `无会话 id · pid ${row.matchedPid}`
-  if (row.terminalId !== null) return `终端 ${row.terminalId.slice(0, 8)}`
-  return '无会话 id'
+
+  if (row.memoryBytes !== null && row.memoryBytes > 0) {
+    return `${base} · ${formatMemory(row.memoryBytes)}`
+  }
+  if (row.matchedPid !== null && isRunning(row) && base !== `pid ${row.matchedPid}`) {
+    return `${base} · pid ${row.matchedPid}`
+  }
+  return base
 }
 
 function describe(error: unknown): string {
@@ -106,16 +121,17 @@ async function refresh(refreshTitles = false): Promise<void> {
   }
 }
 
-/** The row's identity for the close state: chats have no terminal, terminal agents have both. */
+/** The row's identity for the close state: prefers canonical Orca id, then row session/terminal id. */
 function rowKey(row: SessionRow): string {
-  return row.sessionId ?? row.terminalId ?? `${row.workspaceId}:${row.title}`
+  return row.orcaSessionId ?? row.sessionId ?? row.terminalId ?? `${row.workspaceId}:${row.title}`
 }
 
 function canClose(row: SessionRow): boolean {
+  if (!row.stateKnown) return false
   if (row.state !== 'done') return false
   if (row.terminalId !== null) return true
-  if (row.sessionId === null) return false
-  // Only a matched process can be signalled; `unknown` must not make the button promise a close.
+  if (row.sessionId === null && row.orcaSessionId === null) return false
+  // Only a verified running process can be signalled; `unknown` must not make the button promise a close.
   return row.process === 'running'
 }
 
@@ -143,9 +159,9 @@ async function closeSession(row: SessionRow): Promise<void> {
       'sessions.close',
       {
         workspaceId: row.workspaceId,
-        sessionId: row.sessionId,
+        sessionId: row.sessionId ?? row.orcaSessionId,
         terminalId: row.terminalId,
-        pid: row.pairing === 'agent' ? row.matchedPid : null
+        pid: row.pairing === 'lease' ? row.matchedPid : null
       },
       { timeoutMs: 30000 }
     )
@@ -176,9 +192,16 @@ async function reclaimIdle(workspaceId: string): Promise<void> {
     const result = await plugin.request('sessions.reclaim', { workspaceId }, { timeoutMs: 120000 })
     const closed = result.outcomes.filter((outcome) => outcome.ok).length
     const failed = result.outcomes.find((outcome) => !outcome.ok)
+    const currentSessions = read(snapshot)?.sessions ?? []
     for (const outcome of result.outcomes) {
       if (!outcome.ok && outcome.sessionId) {
-        setRowResult(outcome.sessionId, { ok: false, text: `关闭失败：${outcome.message}` })
+        const matchedRow = currentSessions.find(
+          (session) => session.sessionId === outcome.sessionId || session.orcaSessionId === outcome.sessionId
+        )
+        setRowResult(matchedRow ? rowKey(matchedRow) : outcome.sessionId, {
+          ok: false,
+          text: `关闭失败：${outcome.message}`
+        })
       }
     }
     if (failed && !failed.ok) {
@@ -224,26 +247,35 @@ function renderRow(row: SessionRow): OrcaNode {
   const busyThis = read(busyKey) === key
   const otherBusy = read(busyKey) !== null && !busyThis
   const closeable = canClose(row)
-  /** Why the process is not a close target, when it is not. */
-  const unavailable = row.process === 'stopped' ? '未运行' : row.process === 'unknown' ? '无法判定' : null
+  /** Why the row is not a close target, when it is not. */
+  const unavailable =
+    row.process === 'stopped'
+      ? '未运行'
+      : row.process === 'unknown'
+        ? '无法判定'
+        : !row.stateKnown
+          ? '状态未知'
+          : null
   // Every row draws the same slots, in the same order: title / badge, agent, duration, handle.
   const identity = identityLabel(row)
   const lastResult = read(rowResults)[key]
   const state = displayState(row)
   // Explanations live in the close button's tooltip; keeping them out of the row makes every row
-  // the same height. A paired agent's 1:1 note and a 无法判定 reason both read here.
+  // the same height. Lease verification details and 无法判定 reasons both read here.
   const closeAction = row.terminalId !== null ? '将关闭关联终端，无法撤销' : '将向进程组发 SIGTERM，无法撤销'
   const closeTooltip = row.processNote !== null ? `${closeAction}；${row.processNote}` : closeAction
   const disabledTooltip =
-    row.state !== 'done'
-      ? row.processNote !== null
-        ? `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」；${row.processNote}`
-        : `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」`
-      : row.process === 'unknown'
-        ? (row.processNote ?? '没有进程命中这个会话的候选 id，无法判定它是否还在跑；先刷新确认')
-        : row.process === 'stopped'
-          ? '这个会话没有任何可用 id，也没有进程在跑（未运行）'
-          : '这个会话没有终端也没有 sessionId，没法定位进程'
+    row.process === 'unknown'
+      ? (row.processNote ?? '没有进程命中这个会话，无法判定它是否还在跑；先刷新确认')
+      : row.process === 'stopped'
+        ? (row.processNote ?? '这个会话没有活跃进程（未运行）')
+        : !row.stateKnown
+          ? '未从 Orca 获取到会话空闲状态，暂不可关闭'
+          : row.state !== 'done'
+            ? row.processNote !== null
+              ? `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」；${row.processNote}`
+              : `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」`
+            : '这个会话没有终端也没有可用的会话 id，没法定位进程'
 
   return (
     <Box direction="column" gap="xs" padding="sm">
@@ -261,8 +293,14 @@ function renderRow(row: SessionRow): OrcaNode {
               ·
             </Text>
             <Text muted size="xs">
-              {row.state === 'done' ? '已空闲' : '状态持续'}{' '}
-              <RelativeTime at={row.stateStartedAt} format="duration" muted />
+              {!row.stateKnown ? (
+                '状态未知'
+              ) : (
+                <>
+                  {row.state === 'done' ? '已空闲' : '状态持续'}{' '}
+                  <RelativeTime at={row.stateStartedAt} format="duration" muted />
+                </>
+              )}
             </Text>
             <Text muted size="xs">
               ·
@@ -545,7 +583,7 @@ export default function Panel(): OrcaNode {
                 : `将关闭当前工作区「${currentWorkspace?.name ?? currentWorkspaceId}」里 ${idle.length} 个会话：${idle
                     .slice(0, 3)
                     .map((session) => `「${truncateTitle(session.title, 20)}」`)
-                    .join('')}${idle.length > 3 ? ` 等 ${idle.length} 个` : ''}。带终端的走 terminal.close，chat 会话按会话 id（或没有 id 的 agent 按同工作区目录配对）定位进程组后发 SIGTERM，进程会随之结束，无法撤销。`}
+                    .join('')}${idle.length > 3 ? ` 等 ${idle.length} 个` : ''}。带终端的走 terminal.close，chat 会话按会话租约与进程启动时间核验后向进程组发 SIGTERM，进程会随之结束，无法撤销。`}
             </Text>
             {isStale ? (
               <Text muted size="xs">

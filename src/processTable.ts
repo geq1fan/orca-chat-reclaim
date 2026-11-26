@@ -1,17 +1,48 @@
-/** One row of `ps -Ao pid,ppid,pgid,command`. */
-export type PsRow = { pid: number; ppid: number; pgid: number; command: string }
+import type { OwnerProcess } from './sessionRecord'
 
-/** Args are not quoted, so the command is everything after the third number. */
+/** One row of `LC_ALL=C ps -Ao pid,ppid,pgid,lstart,command` (or legacy 4-column test fixture). */
+export type PsRow = {
+  pid: number
+  ppid: number
+  pgid: number
+  startTimeMs: number | null
+  command: string
+}
+
+const PS_WITH_LSTART =
+  /^\s*(\d+)\s+(\d+)\s+(\d+)\s+([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(\S.*)$/
+const PS_LEGACY = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S.*)$/
+
+/** Parses macOS `LC_ALL=C` `lstart` (e.g. `Thu Nov 26 16:29:56 2026` or `Thu Nov  5 09:05:23 2026`). */
+export function parseLstartMs(raw: string): number | null {
+  const normalized = raw.trim().replace(/\s+/g, ' ')
+  const parsed = Date.parse(normalized)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+/** Parses `ps` rows, supporting both 5-column `lstart` output and legacy 4-column test fixtures. */
 export function parseProcessTable(output: string): PsRow[] {
   const rows: PsRow[] = []
   for (const line of output.split('\n')) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S.*)$/.exec(line)
-    if (!match) continue
+    const withLstart = PS_WITH_LSTART.exec(line)
+    if (withLstart) {
+      rows.push({
+        pid: Number(withLstart[1]),
+        ppid: Number(withLstart[2]),
+        pgid: Number(withLstart[3]),
+        startTimeMs: parseLstartMs(withLstart[4]),
+        command: withLstart[5].trimEnd()
+      })
+      continue
+    }
+    const legacy = PS_LEGACY.exec(line)
+    if (!legacy) continue
     rows.push({
-      pid: Number(match[1]),
-      ppid: Number(match[2]),
-      pgid: Number(match[3]),
-      command: match[4]
+      pid: Number(legacy[1]),
+      ppid: Number(legacy[2]),
+      pgid: Number(legacy[3]),
+      startTimeMs: null,
+      command: legacy[4].trimEnd()
     })
   }
   return rows
@@ -20,25 +51,20 @@ export function parseProcessTable(output: string): PsRow[] {
 /** The wrapper Orca puts between itself and an agent CLI; the CLI's parent is this. */
 export const PROVIDER_EXEC = 'orca-provider-exec'
 
+/** Maximum tolerated clock/second-truncation difference between `ps` `lstart` and lease `processStartTimeMs`. */
+export const START_TIME_TOLERANCE_MS = 2000
+
 /**
- * Executables Orca runs under `orca-provider-exec`, named the way `agents.list` names the agent.
- * An executable not listed here is its own kind (the binary name), so a new agent shows up
- * without a code change.
+ * Executables Orca runs under `orca-provider-exec`, named the way `agents.list` / `provider`
+ * names the agent. An executable not listed here is its own kind (the binary name).
  */
 const KIND_BY_BINARY: Record<string, string> = {
   claude: 'claude',
   agy: 'antigravity',
   pi: 'pi',
-  codex: 'codex'
+  codex: 'codex',
+  omp: 'omp'
 }
-
-/**
- * Agent kinds whose CLI takes a conversation id (`--resume=` / `--session-id=`). A live process
- * of the kind is evidence enough; this list covers the case where none is running, so a plain
- * miss is not described as "this agent has no ids". pi is not here: its argv is only
- * `pi --mode rpc` with no id, so it is paired by workspace directory like antigravity.
- */
-const ID_KINDS = new Set(['claude', 'codex'])
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -76,7 +102,7 @@ export type AgentProcess = {
   row: PsRow
   /** The executable that runs the agent, e.g. `/Users/me/.local/bin/agy`. */
   binary: string
-  /** The `agents.list` agent kind, e.g. `antigravity` for `agy`. */
+  /** The `agents.list` / `provider` agent kind, e.g. `antigravity` for `agy`. */
   kind: string
   /** The conversation id its arguments carry; null for agents that take none. */
   providerId: string | null
@@ -99,18 +125,17 @@ export function agentProcesses(rows: readonly PsRow[]): AgentProcess[] {
   for (const row of rows) {
     const binary = wrappers.get(row.ppid)
     if (!binary) continue
-    const [ownBinary] = row.command.split(/\s+/)
-    // The wrapper's tail and the child's argv[0] name the same program; a path spelling
-    // difference (symlink, relative path) must not hide the session.
-    if (binaryName(ownBinary) !== binaryName(binary)) continue
+    if (row.command.includes(PROVIDER_EXEC)) continue
+    const tokens = row.command.trim().split(/\s+/)
+    const expectedName = binaryName(binary)
+    const first = tokens[0] ? binaryName(tokens[0]) : ''
+    const second = tokens[1] ? binaryName(tokens[1]) : ''
+    // The wrapper's tail and the child's argv[0] (or argv[1] for interpreter-hosted CLIs like
+    // `node /path/to/omp`) name the same program; a path spelling difference must not hide it.
+    if (first !== expectedName && second !== expectedName) continue
     processes.push({ row, binary, kind: binaryKind(binary), providerId: parseProviderId(row.command) })
   }
   return processes
-}
-
-/** Whether this agent kind is known to put a conversation id on its command line. */
-export function providesSessionId(kind: string, processes: readonly AgentProcess[]): boolean {
-  return ID_KINDS.has(kind) || processes.some((process) => process.kind === kind && process.providerId !== null)
 }
 
 /**
@@ -145,6 +170,7 @@ export type AgentTarget = {
   pid: number
   ppid: number
   pgid: number
+  startTimeMs: number | null
   command: string
   parentCommand: string
 }
@@ -153,7 +179,16 @@ export type TargetLookup =
   | { ok: true; target: AgentTarget }
   | {
       ok: false
-      code: 'no_process' | 'ambiguous' | 'no_parent' | 'not_group_leader' | 'own_group' | 'kind_mismatch'
+      code:
+        | 'no_process'
+        | 'ambiguous'
+        | 'no_parent'
+        | 'not_group_leader'
+        | 'own_group'
+        | 'kind_mismatch'
+        | 'remote_host'
+        | 'start_time_unknown'
+        | 'start_time_mismatch'
       message: string
     }
 
@@ -197,6 +232,7 @@ function validateTarget(
       pid: target.pid,
       ppid: target.ppid,
       pgid: target.pgid,
+      startTimeMs: target.startTimeMs,
       command: target.command,
       parentCommand: parent.command
     }
@@ -277,30 +313,61 @@ export function findAgentTargetAmong(
 }
 
 /**
- * The agent process a session was paired to by kind, for agents whose CLI takes no session id.
- * Only structurally safe targets pass: the pid must be an agent process of exactly this kind
- * (so a mixed-up pairing can never kill another kind's process), its own group, not ours.
+ * Resolves and validates an agent process from its authoritative `lease.ownerProcess` entry.
+ * Enforces local host, `orca-provider-exec` parent, matching agent kind, process-group isolation,
+ * and `lstart` anti-PID-reuse verification within ±2000ms.
  */
-export function findAgentTargetByPid(
+export function findAgentTargetByLease(
   rows: readonly PsRow[],
-  pid: number,
-  kind: string,
+  ownerProcess: OwnerProcess,
+  expectedKind: string | null = null,
   ownPgid: number | null = null
 ): TargetLookup {
-  const found = agentProcesses(rows).find((process) => process.row.pid === pid)
+  if (ownerProcess.hostId !== 'local') {
+    return {
+      ok: false,
+      code: 'remote_host',
+      message: `该会话运行在远端宿主机（${ownerProcess.hostId}），不支持本地发信号`
+    }
+  }
+
+  const found = agentProcesses(rows).find((process) => process.row.pid === ownerProcess.pid)
   if (!found) {
     return {
       ok: false,
       code: 'no_process',
-      message: `pid ${pid} 不是 ${PROVIDER_EXEC} 拉起的 agent 进程，可能已经退出`
+      message: `租约记录的 pid ${ownerProcess.pid} 不在运行中或不是 ${PROVIDER_EXEC} 拉起的 agent 进程`
     }
   }
-  if (found.kind !== kind) {
+
+  if (expectedKind && expectedKind !== 'unknown' && found.kind !== expectedKind) {
     return {
       ok: false,
       code: 'kind_mismatch',
-      message: `pid ${pid} 跑的是 ${found.kind}，不是这个会话的 agent（${kind}），拒绝`
+      message: `pid ${ownerProcess.pid} 跑的是 ${found.kind}，不是这个会话的 agent（${expectedKind}），拒绝`
     }
   }
-  return validateTarget(rows, found, ownPgid)
+
+  const validated = validateTarget(rows, found, ownPgid)
+  if (!validated.ok) return validated
+
+  if (ownerProcess.processStartTimeMs !== null) {
+    if (found.row.startTimeMs === null) {
+      return {
+        ok: false,
+        code: 'start_time_unknown',
+        message: `读不到 pid ${ownerProcess.pid} 的进程启动时间（lstart），无法确认未被 PID 复用，拒绝`
+      }
+    }
+    const delta = Math.abs(found.row.startTimeMs - ownerProcess.processStartTimeMs)
+    if (delta > START_TIME_TOLERANCE_MS) {
+      return {
+        ok: false,
+        code: 'start_time_mismatch',
+        message: `pid ${ownerProcess.pid} 的启动时间与租约记录相差 ${delta}ms（超过 ${START_TIME_TOLERANCE_MS}ms 容差），怀疑 PID 已被复用，拒绝`
+      }
+    }
+  }
+
+  return validated
 }

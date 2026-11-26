@@ -1,22 +1,133 @@
 import { messageOf } from './errors'
+import { isFilePath } from './labels'
 import type { CloseOutcome } from './protocol'
 import {
   findAgentTargetAmong,
-  findAgentTargetByPid,
+  findAgentTargetByLease,
   parseProcessTable,
+  parseProviderId,
   type AgentTarget,
   type PsRow
 } from './processTable'
-import { sessionCandidates, type SessionRecord } from './sessionRecord'
+import { findSessionRecord, sessionCandidates, type SessionRecord } from './sessionRecord'
 
-/** Everything `stopSessionWithSignal` needs from the machine; tests pass fakes. */
+export type MemoryChat = {
+  agentSessionId: string
+  agent: string
+  name: string
+  cpu: number
+  memory: number
+}
+
+export type MemoryTerminalSession = {
+  sessionId: string
+  paneKey: string | null
+  pid: number
+  cpu: number
+  memory: number
+}
+
+export type MemoryWorktree = {
+  worktreeId: string
+  worktreeName: string
+  repoId: string | null
+  repoName: string | null
+  cpu: number
+  memory: number
+  chats: MemoryChat[]
+  sessions: MemoryTerminalSession[]
+}
+
+export type MemorySnapshot = {
+  worktrees: MemoryWorktree[]
+}
+
+function finiteNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+/** Parses `orca diagnostics memory --json` output into a typed snapshot, or null when invalid. */
+export function parseMemorySnapshot(output: string): MemorySnapshot | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(output)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  const envelope = parsed as { ok?: unknown; result?: { worktrees?: unknown } }
+  if (envelope.ok === false) return null
+  const rawWorktrees = envelope.result?.worktrees
+  if (!Array.isArray(rawWorktrees)) return null
+
+  const worktrees: MemoryWorktree[] = []
+  for (const item of rawWorktrees) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const wt = item as Record<string, unknown>
+    const worktreeId = nonEmptyString(wt.worktreeId)
+    if (!worktreeId) continue
+
+    const chats: MemoryChat[] = []
+    if (Array.isArray(wt.chats)) {
+      for (const rawChat of wt.chats) {
+        if (!rawChat || typeof rawChat !== 'object' || Array.isArray(rawChat)) continue
+        const chat = rawChat as Record<string, unknown>
+        const agentSessionId = nonEmptyString(chat.agentSessionId)
+        if (!agentSessionId) continue
+        chats.push({
+          agentSessionId,
+          agent: nonEmptyString(chat.agent) ?? 'unknown',
+          name: typeof chat.name === 'string' ? chat.name : '',
+          cpu: finiteNumber(chat.cpu),
+          memory: finiteNumber(chat.memory)
+        })
+      }
+    }
+
+    const sessions: MemoryTerminalSession[] = []
+    if (Array.isArray(wt.sessions)) {
+      for (const rawSession of wt.sessions) {
+        if (!rawSession || typeof rawSession !== 'object' || Array.isArray(rawSession)) continue
+        const session = rawSession as Record<string, unknown>
+        const sessionId = nonEmptyString(session.sessionId)
+        if (!sessionId) continue
+        sessions.push({
+          sessionId,
+          paneKey: nonEmptyString(session.paneKey),
+          pid: finiteNumber(session.pid),
+          cpu: finiteNumber(session.cpu),
+          memory: finiteNumber(session.memory)
+        })
+      }
+    }
+
+    worktrees.push({
+      worktreeId,
+      worktreeName: typeof wt.worktreeName === 'string' ? wt.worktreeName : '',
+      repoId: nonEmptyString(wt.repoId),
+      repoName: nonEmptyString(wt.repoName),
+      cpu: finiteNumber(wt.cpu),
+      memory: finiteNumber(wt.memory),
+      chats,
+      sessions
+    })
+  }
+
+  return { worktrees }
+}
+
+/** Everything `stopSessionByLease` / `stopSessionWithSignal` and `readSnapshot` need from the host; tests pass fakes. */
 export type SignalOps = {
-  /** Every stored Orca session with the conversation ids in its handle chain. */
+  /** Every stored Orca session with its ids and authoritative lease metadata. */
   listSessionRecords(): Promise<SessionRecord[]>
-  /** `ps -Ao pid,ppid,pgid,command` output. */
+  /** `LC_ALL=C ps -Ao pid,ppid,pgid,lstart,command` output. */
   listProcesses(): Promise<string>
-  /** `lsof -a -p <pid> -d cwd -Fn`: the process's working directory, or null when unreadable. */
-  processCwd(pid: number): Promise<string | null>
+  /** `orca diagnostics memory --json` snapshot, or null if unavailable. */
+  readMemorySnapshot(): Promise<MemorySnapshot | null>
   /** SIGTERM to the whole process group. */
   signalGroup(pgid: number): void
   isAlive(pid: number): boolean
@@ -78,20 +189,19 @@ async function readTable(ops: SignalOps): Promise<PsRow[] | { error: Error }> {
 }
 
 /**
- * Stops a chat session by SIGTERM-ing the agent process group that runs it. The session's own id
- * and every id in its stored handle chain are candidates, so a rewind that moved the process to
- * a new conversation id still reaches it. Nothing is signalled unless the process was started by
- * `orca-provider-exec`, is its own process group, and (with `dryRun`) nothing is signalled at
- * all — it only reports what it found. A TERM that does not take the process down in five
- * seconds is reported as a failure; this never escalates to SIGKILL.
+ * Fallback close by CLI `--resume=` / `--session-id=` flags when `agent_session_records`
+ * is unreadable or has no record for a CLI-id-carrying session.
  */
 export async function stopSessionWithSignal(options: {
   workspaceId: string
+  workspacePath?: string | null
   sessionId: string
   dryRun: boolean
   ops: SignalOps
+  preloadedRecords?: readonly SessionRecord[]
+  preloadedDbError?: string | null
 }): Promise<CloseOutcome> {
-  const { workspaceId, sessionId, dryRun, ops } = options
+  const { workspaceId, workspacePath, sessionId, dryRun, ops } = options
   const base: SignalBase = { workspaceId, sessionId, how: 'signal', dryRun }
 
   const notes: string[] = []
@@ -101,14 +211,20 @@ export async function stopSessionWithSignal(options: {
     return { ...base, ok: false, code: 'ps_failed', message: `读进程表失败：${messageOf(table.error)}` }
   }
 
-  let records: SessionRecord[] = []
-  try {
-    records = await ops.listSessionRecords()
-  } catch (error) {
-    // Without the chain only the id the row carries can be matched; the refusal names why.
-    notes.push(`读会话数据库失败：${messageOf(error)}`)
+  let records: readonly SessionRecord[] = []
+  if (options.preloadedRecords !== undefined) {
+    records = options.preloadedRecords
+  } else if (options.preloadedDbError !== undefined) {
+    if (options.preloadedDbError) notes.push(`读会话数据库失败：${options.preloadedDbError}`)
+  } else {
+    try {
+      records = await ops.listSessionRecords()
+    } catch (error) {
+      // Without the chain only the id the row carries can be matched; the refusal names why.
+      notes.push(`读会话数据库失败：${messageOf(error)}`)
+    }
   }
-  const candidates = sessionCandidates(records, sessionId)
+  const candidates = sessionCandidates(records, sessionId, workspaceId, workspacePath ?? null)
 
   const ownPgid = await ops.ownPgid().catch(() => null)
   const found = findAgentTargetAmong(table, candidates.length > 0 ? candidates : [sessionId], ownPgid)
@@ -118,7 +234,12 @@ export async function stopSessionWithSignal(options: {
     return { ...base, ok: false, code: found.code, message: `${found.message}${notesText}` }
   }
 
-  const detail = { sessionUuid: found.providerId, pid: found.target.pid, pgid: found.target.pgid, parentArgs: found.target.parentCommand }
+  const detail = {
+    sessionUuid: found.providerId,
+    pid: found.target.pid,
+    pgid: found.target.pgid,
+    parentArgs: found.target.parentCommand
+  }
   if (dryRun) return { ...base, ok: true, ...detail }
 
   const outcome = await signalAndWait(base, found.target, ops)
@@ -126,25 +247,107 @@ export async function stopSessionWithSignal(options: {
 }
 
 /**
- * Stops a chat session of an agent that puts no session id on its command line. The target is
- * the pid its kind was paired to at read time; `findAgentTargetByPid` still refuses anything
- * that is no longer an agent process of exactly that kind, and the process's cwd must still be
- * the workspace directory the pairing was made in. A stale or mixed-up pairing therefore cannot
- * reach a different agent's process or another workspace's.
+ * Stops a chat session after re-reading `agent_session_records` and `ps -Ao pid,ppid,pgid,lstart,command`
+ * to defeat TOCTOU races and PID reuse. Verifies:
+ * - unique record lookup (canonical id -> nativeId -> chainIds, narrowed by workspace),
+ * - `claimStatus === 'live'`, `!unreconciled`, `ownerProcess.hostId === 'local'`,
+ * - `ownerProcess.pid === expectedPid` when `expectedPid` was supplied,
+ * - `findAgentTargetByLease` (orca-provider-exec parent, matching kind, pgid === pid,
+ *   not worker pgid, and `lstart` within ±2000ms of `ownerProcess.processStartTimeMs`).
+ * Falls back to `stopSessionWithSignal` only when the DB is unreadable or has no record and the
+ * session identifier is a non-path id that a CLI flag could carry.
  */
-export async function stopPairedSession(options: {
+export async function stopSessionByLease(options: {
   workspaceId: string
+  workspacePath?: string | null
   sessionId: string
-  /** The agent kind the pairing was made for. */
-  agent: string
-  pid: number
-  /** The workspace directory the pairing used; a changed cwd refuses. */
-  workspacePath: string | null
+  expectedAgent?: string | null
+  expectedPid?: number | null
   dryRun: boolean
   ops: SignalOps
 }): Promise<CloseOutcome> {
-  const { workspaceId, sessionId, agent, pid, workspacePath, dryRun, ops } = options
+  const { workspaceId, workspacePath, sessionId, expectedAgent, expectedPid, dryRun, ops } = options
   const base: SignalBase = { workspaceId, sessionId, how: 'signal', dryRun }
+
+  let records: SessionRecord[]
+  try {
+    records = await ops.listSessionRecords()
+  } catch (error) {
+    const dbError = messageOf(error)
+    if (expectedPid == null && !isFilePath(sessionId)) {
+      return stopSessionWithSignal({
+        workspaceId,
+        workspacePath,
+        sessionId,
+        dryRun,
+        ops,
+        preloadedDbError: dbError
+      })
+    }
+    return { ...base, ok: false, code: 'db_failed', message: `读会话数据库失败：${dbError}` }
+  }
+
+  const lookup = findSessionRecord(records, sessionId, workspaceId, workspacePath ?? null)
+  if (lookup.status === 'ambiguous') {
+    return {
+      ...base,
+      ok: false,
+      code: 'ambiguous',
+      message: `会话数据库里 ${sessionId} 命中 ${lookup.records.length} 条记录，不敢猜要关哪一个`
+    }
+  }
+  if (lookup.status === 'not_found') {
+    if (expectedPid == null && !isFilePath(sessionId)) {
+      return stopSessionWithSignal({
+        workspaceId,
+        workspacePath,
+        sessionId,
+        dryRun,
+        ops,
+        preloadedRecords: records
+      })
+    }
+    return {
+      ...base,
+      ok: false,
+      code: 'no_record',
+      message: '会话数据库里找不到这条会话的租约记录，拒绝盲杀'
+    }
+  }
+
+  const { record } = lookup
+  if (record.unreconciled) {
+    return {
+      ...base,
+      ok: false,
+      code: 'lease_unreconciled',
+      message: '这条会话的租约处于未对账状态（unreconciled），拒绝关闭'
+    }
+  }
+  if (record.claimStatus !== 'live' || record.ownerProcess === null) {
+    return {
+      ...base,
+      ok: false,
+      code: 'lease_not_live',
+      message: `会话租约状态为 ${record.claimStatus ?? '未知'}，没有活跃进程可关`
+    }
+  }
+  if (record.ownerProcess.hostId !== 'local') {
+    return {
+      ...base,
+      ok: false,
+      code: 'remote_host',
+      message: `该会话运行在远端宿主机（${record.ownerProcess.hostId}），不支持本地发信号`
+    }
+  }
+  if (expectedPid !== null && expectedPid !== undefined && record.ownerProcess.pid !== expectedPid) {
+    return {
+      ...base,
+      ok: false,
+      code: 'process_changed',
+      message: `会话进程已变化（期望 pid ${expectedPid}，当前租约是 pid ${record.ownerProcess.pid}），刷新确认后再关`
+    }
+  }
 
   const table = await readTable(ops)
   if ('error' in table) {
@@ -152,31 +355,19 @@ export async function stopPairedSession(options: {
   }
 
   const ownPgid = await ops.ownPgid().catch(() => null)
-  const found = findAgentTargetByPid(table, pid, agent, ownPgid)
-  if (!found.ok) return { ...base, ok: false, code: found.code, message: found.message }
-
-  if (workspacePath === null) {
-    return {
-      ...base,
-      ok: false,
-      code: 'workspace_unknown',
-      message: `不知道这个工作区的目录路径，无法确认 pid ${pid} 仍属于它，拒绝`
-    }
-  }
-  const cwd = await ops.processCwd(pid).catch(() => null)
-  if (cwd !== workspacePath) {
-    return {
-      ...base,
-      ok: false,
-      code: 'cwd_mismatch',
-      message:
-        cwd === null
-          ? `读不到 pid ${pid} 的 cwd，无法确认它仍在工作区 ${workspacePath}，拒绝`
-          : `pid ${pid} 的 cwd 现在是 ${cwd}，不再等于工作区路径 ${workspacePath}，拒绝`
-    }
+  const expectedKind = expectedAgent && expectedAgent !== 'unknown' ? expectedAgent : record.provider
+  const found = findAgentTargetByLease(table, record.ownerProcess, expectedKind, ownPgid)
+  if (!found.ok) {
+    return { ...base, ok: false, code: found.code, message: found.message }
   }
 
-  const detail = { pid: found.target.pid, pgid: found.target.pgid, parentArgs: found.target.parentCommand }
+  const sessionUuid = parseProviderId(found.target.command)
+  const detail = {
+    ...(sessionUuid ? { sessionUuid } : {}),
+    pid: found.target.pid,
+    pgid: found.target.pgid,
+    parentArgs: found.target.parentCommand
+  }
   if (dryRun) return { ...base, ok: true, ...detail }
 
   const outcome = await signalAndWait(base, found.target, ops)

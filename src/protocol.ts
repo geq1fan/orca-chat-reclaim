@@ -3,10 +3,10 @@ export {}
 
 export type AgentState = 'working' | 'blocked' | 'waiting' | 'done'
 
-/** What `ps` says about a chat session's process; see `SessionRow.process`. */
+/** What Orca's session lease and `ps` say about a chat session's process; see `SessionRow.process`. */
 export type ProcessState = 'running' | 'unknown' | 'stopped'
 
-/** One agent session as `agents.list` reports it, tagged with the workspace it lives in. */
+/** One agent session as `agents.list` / `diagnostics.memory` reports it, tagged with its workspace. */
 export type SessionRow = {
   workspaceId: string
   workspaceName: string
@@ -19,28 +19,36 @@ export type SessionRow = {
   title: string
   agent: string
   state: AgentState
+  /**
+   * True when `agents.list` reported the session's live state; false when the session appeared
+   * only in `orca diagnostics memory` (e.g. `agents.list` omitted or failed for its workspace),
+   * in which case close actions stay disabled to avoid killing an active session blindly.
+   */
+  stateKnown: boolean
   stateStartedAt: number
   sessionId: string | null
+  /** Canonical Orca `session_id` UUID when known; never a filesystem path. */
+  orcaSessionId: string | null
+  /** Memory usage in bytes reported by `orca diagnostics memory`, or null when unavailable. */
+  memoryBytes: number | null
   /**
-   * The process side of a chat session: `running` when a live agent process was matched — by one
-   * of its candidate ids (both `--session-id=` and `--resume=` count), or, for an agent whose
-   * CLI takes no id, by the kind's one-to-one pairing. `unknown` when it could not be judged
-   * (ids that matched nothing, `ps` unreadable, or an id-less agent whose session and process
-   * counts differ); `stopped` only when it has no id a process could carry. Null for
-   * terminal-backed sessions, which are addressed by their terminal instead.
+   * The process side of a chat session: `running` when verified via `agent_session_records.lease`
+   * (with `ps` `lstart` anti-PID-reuse check) or via a CLI `--session-id=` / `--resume=` flag;
+   * `stopped` when its lease is released and no live process exists; `unknown` when the lease/db/`ps`
+   * cannot confirm either way. Null for terminal-backed sessions, addressed by their terminal instead.
    */
   process: ProcessState | null
   /**
-   * The candidate id whose agent process matched. The row shows this id, and looks its title up
-   * by the same id, so a rewind cannot pair one conversation's title with another's process.
+   * The provider conversation id the live process carried on its CLI (`--resume=` / `--session-id=`),
+   * when present; null for agents whose CLI carries no id (e.g. `pi`, `antigravity`).
    */
   matchedId: string | null
-  /** How the process was found: `id` exact, `agent` by the kind's 1:1 pairing; null when unmatched. */
-  pairing: 'id' | 'agent' | null
-  /** The matched process group, for an `agent` pairing. Id matches are re-resolved by id at close. */
+  /** How the process was verified: `lease` via `lease.ownerProcess` + `lstart`, `id` via CLI flag; null when unmatched. */
+  pairing: 'lease' | 'id' | null
+  /** The verified agent pid/pgid when matched via `lease` (also carried into `sessions.close` against TOCTOU). */
   matchedPid: number | null
   matchedPgid: number | null
-  /** Why the process could not be judged, or how a pairing was made; null when nothing is to say. */
+  /** Why the process could not be judged, or how it was verified / exited; null when nothing is to say. */
   processNote: string | null
 }
 
@@ -48,7 +56,7 @@ export type WorkspaceRow = {
   id: string
   name: string
   kind: 'worktree' | 'folder'
-  /** The directory `workspace.list` gives; id-less agents are paired and re-checked against it. */
+  /** The directory `workspace.list` (or worktree id suffix) gives. */
   path: string | null
   terminalCount: number | null
 }
@@ -76,7 +84,7 @@ export type CloseOutcome = {
   code?: string
   message?: string
   terminalId?: string
-  /** The conversation id the process answered to; absent when the match was by agent kind. */
+  /** The conversation id the process answered to, when the agent CLI carries one. */
   sessionUuid?: string
   pid?: number
   pgid?: number
@@ -116,8 +124,9 @@ declare module 'orca' {
       output: SessionSnapshot
     }
     /**
-     * Stops one session; only a `done` session is accepted. `pid` is the process an id-less
-     * agent's row was paired to; the worker re-reads the pairing before signalling it.
+     * Stops one session; only a `done` session with known state is accepted. When `pid` is
+     * provided, the worker re-reads the session's live lease and verifies `ownerProcess.pid`
+     * and `ps` `lstart` before signalling it.
      */
     'sessions.close': {
       input: {
