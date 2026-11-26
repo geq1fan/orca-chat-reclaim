@@ -412,7 +412,7 @@ test('sessions.list shows the chat title from the bot list and caches it for a m
 test('a title found under the Orca session id lands on the provider id row', async () => {
   const host = hostWith([chat(S1)])
   fakeOps(processTable([{ pid: 900, resume: S1 }]), undefined, [
-    { sessionId: 'orca-session-1', chainIds: [S1] }
+    { sessionId: 'orca-session-1', nativeId: S1, chainIds: [S1] }
   ])
   fakeTitles({ 'orca-session-1': '上线单 13703928' })
   const worker = await mountWorker(main, { host })
@@ -422,6 +422,26 @@ test('a title found under the Orca session id lands on the provider id row', asy
   // The row shows the id the process answered to, and that same id found the title.
   assert.equal(snapshot.sessions[0]?.matchedId, S1)
   assert.equal(snapshot.sessions[0]?.title, '上线单 13703928')
+  await worker.deactivate()
+})
+
+test('an antigravity chat whose only native id is adopted shows its title', async () => {
+  // The real "小小" case: Orca session 7980aac2 owns the chat, its record adopted b9388fd5 as
+  // the native id, and the chain names only that native id — there is no claude-style chain
+  // sessionId to alias from. The row shows b9388fd5, so its title must come from the adopted id.
+  const ORCA = '7980aac2-bf09-406f-9627-8294f76955b4'
+  const title = '我想开发一个orca插件，用于展示我创建的MR列表，点击后可以在浏览器打开。先画下原型'
+  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
+  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]), undefined, [
+    { sessionId: ORCA, nativeId: ANTI, chainIds: [ANTI] }
+  ])
+  fakeTitles({ [ORCA]: title })
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list', {})
+
+  assert.equal(snapshot.sessions[0]?.sessionId, ANTI)
+  assert.equal(snapshot.sessions[0]?.title, title)
   await worker.deactivate()
 })
 
@@ -490,10 +510,14 @@ test('maps four live sessions one to one, even when Orca reports an older id', a
     ]),
     undefined,
     [
-      { sessionId: HOME_ORCA, chainIds: [HOME_NATIVE] },
-      { sessionId: COORD_ORCA, chainIds: ['39e65ad8-b388-4e57-8d80-e3ad8dc791e8', COORD_NATIVE] },
-      { sessionId: SEARCH_ORCA, chainIds: [SEARCH_OLD, SEARCH_NATIVE] },
-      { sessionId: DEPLOY_ORCA, chainIds: [DEPLOY_NATIVE] }
+      { sessionId: HOME_ORCA, nativeId: HOME_NATIVE, chainIds: [HOME_NATIVE] },
+      {
+        sessionId: COORD_ORCA,
+        nativeId: COORD_NATIVE,
+        chainIds: ['39e65ad8-b388-4e57-8d80-e3ad8dc791e8', COORD_NATIVE]
+      },
+      { sessionId: SEARCH_ORCA, nativeId: SEARCH_NATIVE, chainIds: [SEARCH_OLD, SEARCH_NATIVE] },
+      { sessionId: DEPLOY_ORCA, nativeId: DEPLOY_NATIVE, chainIds: [DEPLOY_NATIVE] }
     ]
   )
   fakeTitles({
