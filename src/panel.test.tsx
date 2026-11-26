@@ -19,6 +19,10 @@ function row(overrides: Partial<SessionRow>): SessionRow {
     sessionId: 'session-t1',
     process: null,
     matchedId: null,
+    pairing: null,
+    matchedPid: null,
+    matchedPgid: null,
+    processNote: null,
     ...overrides
   }
 }
@@ -290,6 +294,54 @@ test('a done chat whose ids matched no process is 无法判定 and greyed', asyn
   assert.equal(view.find({ role: 'button', text: '无法判定' })?.disabled, true)
   assert.ok(view.find({ text: '无法判定' }))
   assert.ok(view.find({ text: /可回收 0 个/ }))
+  assert.deepEqual(view.errors, [])
+})
+
+test('an id-less pairing reads 运行中（无会话 id）, and 无法判定 names its reason', async () => {
+  const idless: SessionSnapshot = {
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
+    sessions: [
+      row({
+        workspaceId: 'folder:1',
+        workspaceName: '小小',
+        workspaceKind: 'folder',
+        terminalId: null,
+        title: '我想开发一个 orca 插件…',
+        agent: 'antigravity',
+        sessionId: 'b9388fd5-6cae-42ad-9627-0aad35007921',
+        process: 'running',
+        pairing: 'agent',
+        matchedPid: 8993,
+        matchedPgid: 8993,
+        processNote:
+          'antigravity 不提供会话 id；本机这种会话 1 个、进程 1 个，1:1 配到 pid 8993（pgid 8993）'
+      }),
+      row({
+        workspaceId: 'folder:1',
+        workspaceName: '小小',
+        workspaceKind: 'folder',
+        terminalId: null,
+        title: '会话 1d5698f7',
+        sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
+        process: 'unknown',
+        processNote: '有 1 个工作区没读到，无法确认本机 claude 的会话总数，不配对'
+      })
+    ],
+    currentWorkspaceId: 'folder:1',
+    workspacesTruncated: false,
+    failedWorkspaces: 0,
+    recentOps: [],
+  }
+  view = await mount(panel, {
+    host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => idless } })
+  })
+
+  assert.ok(view.find({ text: '运行中（无会话 id）' }))
+  assert.ok(view.find({ text: 'pid 8993' }))
+  assert.ok(view.find({ text: '无法判定：有 1 个工作区没读到，无法确认本机 claude 的会话总数，不配对' }))
+  // The paired row is closeable; the unjudged one is not.
+  assert.equal(view.find({ role: 'button', text: '关闭' })?.disabled, false)
+  assert.equal(view.find({ role: 'button', text: '无法判定' })?.disabled, true)
   assert.deepEqual(view.errors, [])
 })
 

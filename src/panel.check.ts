@@ -1,6 +1,9 @@
 // `orca plugin check` renders the panel once per scenario. `real` is a snapshot taken from the
-// live host after the id-mapping fix: the four live 小小 chats are matched by the ids their claude
-// processes carry, even where `agents.list` still reports an older id.
+// live host during the 0.1.4 work, with the workspaces that hold no session dropped to keep the
+// fixture small. The three running 小小 claude chats match by the ids their processes carry; the
+// antigravity chat — whose CLI has no --session-id/--resume and shares its cwd with every other
+// chat — is paired one to one with the machine's only agy process (pid 8993); the finished chat
+// whose process is gone now names that reason instead of a bare 无法判定.
 import { defineCheck, hostError } from 'orca/testing'
 import type { SessionSnapshot } from './protocol'
 
@@ -13,8 +16,8 @@ const real: SessionSnapshot = {
       "terminalCount": 1
     },
     {
-      "id": "identity:wt2:local:9f2b4863-0493-45a7-8fda-abc10514292f",
-      "name": "Fix session process title",
+      "id": "identity:wt2:local:aded6ef9-26a9-4d47-9d77-bb5218b60734",
+      "name": "Fix remaining session mismatch",
       "kind": "worktree",
       "terminalCount": 0
     },
@@ -73,20 +76,28 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795676106597,
       "sessionId": "01a21695-96fe-76b1-8521-e4ba75d3213d",
       "process": null,
-      "matchedId": null
+      "matchedId": null,
+      "pairing": null,
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
-      "workspaceId": "identity:wt2:local:9f2b4863-0493-45a7-8fda-abc10514292f",
-      "workspaceName": "Fix session process title",
+      "workspaceId": "identity:wt2:local:aded6ef9-26a9-4d47-9d77-bb5218b60734",
+      "workspaceName": "Fix remaining session mismatch",
       "workspaceKind": "worktree",
       "terminalId": null,
-      "title": "会话 77b4a752",
+      "title": "会话 de4a78f3",
       "agent": "claude",
       "state": "working",
-      "stateStartedAt": 1795677059794,
-      "sessionId": "77b4a752-9be7-4dfb-8ac1-3776a1c30e36",
+      "stateStartedAt": 1795679076012,
+      "sessionId": "de4a78f3-939c-4e41-b01b-34517d90603a",
       "process": "running",
-      "matchedId": "77b4a752-9be7-4dfb-8ac1-3776a1c30e36"
+      "matchedId": "de4a78f3-939c-4e41-b01b-34517d90603a",
+      "pairing": "id",
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
       "workspaceId": "folder:f8168b9e-ba71-4fbf-9b41-2b152abde888",
@@ -99,7 +110,11 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795617250268,
       "sessionId": "5a51a82b-9f4b-47eb-9763-52f5e4e38a4d",
       "process": "unknown",
-      "matchedId": null
+      "matchedId": null,
+      "pairing": null,
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": "会话 id 没有命中任何进程（进程可能已退出，或 ps 里看不到）"
     },
     {
       "workspaceId": "folder:cf9721a4-3ce2-410f-87d5-55da80cefb6e",
@@ -112,7 +127,11 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795593041702,
       "sessionId": null,
       "process": "stopped",
-      "matchedId": null
+      "matchedId": null,
+      "pairing": null,
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
       "workspaceId": "folder:52cc4ad7-ad59-4592-bf32-e6e3fe0734d5",
@@ -125,7 +144,11 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795593035676,
       "sessionId": null,
       "process": "stopped",
-      "matchedId": null
+      "matchedId": null,
+      "pairing": null,
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
       "workspaceId": "folder:7b3ccc56-eecd-478c-b440-0cf4e5c31d61",
@@ -138,7 +161,11 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795677648300,
       "sessionId": "028a62e6-3577-47c2-a77e-bcfda06a2096",
       "process": "running",
-      "matchedId": "028a62e6-3577-47c2-a77e-bcfda06a2096"
+      "matchedId": "028a62e6-3577-47c2-a77e-bcfda06a2096",
+      "pairing": "id",
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
       "workspaceId": "folder:9d5ad5ae-bcb1-483e-9d22-290c80b7ce8a",
@@ -151,7 +178,11 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795573554610,
       "sessionId": null,
       "process": "stopped",
-      "matchedId": null
+      "matchedId": null,
+      "pairing": null,
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
       "workspaceId": "folder:a151ba26-a0a2-4e84-bf64-fcfe9b155cd0",
@@ -164,7 +195,28 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795573491428,
       "sessionId": null,
       "process": "stopped",
-      "matchedId": null
+      "matchedId": null,
+      "pairing": null,
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
+    },
+    {
+      "workspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
+      "workspaceName": "小小",
+      "workspaceKind": "folder",
+      "terminalId": null,
+      "title": "分析当前 Mac 内存占用",
+      "agent": "claude",
+      "state": "done",
+      "stateStartedAt": 1795679096906,
+      "sessionId": "82092408-37fb-4ae5-bf44-83d986eb1e14",
+      "process": "running",
+      "matchedId": "82092408-37fb-4ae5-bf44-83d986eb1e14",
+      "pairing": "id",
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
       "workspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
@@ -173,11 +225,15 @@ const real: SessionSnapshot = {
       "terminalId": null,
       "title": "未匹配到题目问题排查",
       "agent": "claude",
-      "state": "working",
-      "stateStartedAt": 1795677936261,
+      "state": "done",
+      "stateStartedAt": 1795678718413,
       "sessionId": "600d75f6-dbf4-44e5-bb55-9c35e614370b",
       "process": "running",
-      "matchedId": "600d75f6-dbf4-44e5-bb55-9c35e614370b"
+      "matchedId": "600d75f6-dbf4-44e5-bb55-9c35e614370b",
+      "pairing": "id",
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
       "workspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
@@ -190,33 +246,11 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795677643466,
       "sessionId": "13d8d80f-16b4-4ba3-b3a3-89df1d3e8bc4",
       "process": "running",
-      "matchedId": "13d8d80f-16b4-4ba3-b3a3-89df1d3e8bc4"
-    },
-    {
-      "workspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
-      "workspaceName": "小小",
-      "workspaceKind": "folder",
-      "terminalId": null,
-      "title": "Home",
-      "agent": "claude",
-      "state": "done",
-      "stateStartedAt": 1795677349425,
-      "sessionId": "dd411755-4b8d-4ebc-b89f-9ef38d089774",
-      "process": "running",
-      "matchedId": "dd411755-4b8d-4ebc-b89f-9ef38d089774"
-    },
-    {
-      "workspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
-      "workspaceName": "小小",
-      "workspaceKind": "folder",
-      "terminalId": null,
-      "title": "分析当前 Mac 内存占用",
-      "agent": "claude",
-      "state": "done",
-      "stateStartedAt": 1795677094812,
-      "sessionId": "82092408-37fb-4ae5-bf44-83d986eb1e14",
-      "process": "running",
-      "matchedId": "82092408-37fb-4ae5-bf44-83d986eb1e14"
+      "matchedId": "13d8d80f-16b4-4ba3-b3a3-89df1d3e8bc4",
+      "pairing": "id",
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": null
     },
     {
       "workspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
@@ -228,8 +262,12 @@ const real: SessionSnapshot = {
       "state": "done",
       "stateStartedAt": 1795676181727,
       "sessionId": "b9388fd5-6cae-42ad-9627-0aad35007921",
-      "process": "unknown",
-      "matchedId": null
+      "process": "running",
+      "matchedId": null,
+      "pairing": "agent",
+      "matchedPid": 8993,
+      "matchedPgid": 8993,
+      "processNote": "antigravity 不提供会话 id；本机这种会话 1 个、进程 1 个，1:1 配到 pid 8993（pgid 8993）"
     },
     {
       "workspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
@@ -242,7 +280,11 @@ const real: SessionSnapshot = {
       "stateStartedAt": 1795661844911,
       "sessionId": "1d5698f7-3890-4fa9-be15-b096359f32d9",
       "process": "unknown",
-      "matchedId": null
+      "matchedId": null,
+      "pairing": null,
+      "matchedPid": null,
+      "matchedPgid": null,
+      "processNote": "会话 id 没有命中任何进程（进程可能已退出，或 ps 里看不到）"
     }
   ],
   "currentWorkspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
@@ -333,7 +375,7 @@ const real: SessionSnapshot = {
 export default defineCheck({
   real: { requests: { 'sessions.list': real } },
   realOpen: {
-    storage: { showStopped: true, expandedGroups: {"identity:wt2:local:7072fb48-0d5c-413a-9d3e-f6a4830ae582": true, "identity:wt2:local:9f2b4863-0493-45a7-8fda-abc10514292f": true, "folder:f8168b9e-ba71-4fbf-9b41-2b152abde888": true, "folder:cf9721a4-3ce2-410f-87d5-55da80cefb6e": true, "folder:52cc4ad7-ad59-4592-bf32-e6e3fe0734d5": true, "folder:7b3ccc56-eecd-478c-b440-0cf4e5c31d61": true, "folder:9d5ad5ae-bcb1-483e-9d22-290c80b7ce8a": true, "folder:a151ba26-a0a2-4e84-bf64-fcfe9b155cd0": true, "folder:637d87aa-162f-41f8-ba04-b7313fbcd372": true} },
+    storage: { showStopped: true, expandedGroups: {"identity:wt2:local:7072fb48-0d5c-413a-9d3e-f6a4830ae582": true, "identity:wt2:local:aded6ef9-26a9-4d47-9d77-bb5218b60734": true, "folder:f8168b9e-ba71-4fbf-9b41-2b152abde888": true, "folder:cf9721a4-3ce2-410f-87d5-55da80cefb6e": true, "folder:52cc4ad7-ad59-4592-bf32-e6e3fe0734d5": true, "folder:7b3ccc56-eecd-478c-b440-0cf4e5c31d61": true, "folder:9d5ad5ae-bcb1-483e-9d22-290c80b7ce8a": true, "folder:a151ba26-a0a2-4e84-bf64-fcfe9b155cd0": true, "folder:637d87aa-162f-41f8-ba04-b7313fbcd372": true} },
     requests: { 'sessions.list': real }
   },
   empty: {

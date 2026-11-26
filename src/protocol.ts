@@ -22,17 +22,26 @@ export type SessionRow = {
   stateStartedAt: number
   sessionId: string | null
   /**
-   * The process side of a chat session: `running` when a live claude carries one of its candidate
-   * ids (both `--session-id=` and `--resume=` count), `unknown` when it has ids but none of them
-   * matched (or `ps` could not be read), `stopped` only when it has no id a process could carry.
-   * Null for terminal-backed sessions, which are addressed by their terminal instead.
+   * The process side of a chat session: `running` when a live agent process was matched — by one
+   * of its candidate ids (both `--session-id=` and `--resume=` count), or, for an agent whose
+   * CLI takes no id, by the kind's one-to-one pairing. `unknown` when it could not be judged
+   * (ids that matched nothing, `ps` unreadable, or an id-less agent whose session and process
+   * counts differ); `stopped` only when it has no id a process could carry. Null for
+   * terminal-backed sessions, which are addressed by their terminal instead.
    */
   process: ProcessState | null
   /**
-   * The candidate id whose claude process matched. The row shows this id, and looks its title up
+   * The candidate id whose agent process matched. The row shows this id, and looks its title up
    * by the same id, so a rewind cannot pair one conversation's title with another's process.
    */
   matchedId: string | null
+  /** How the process was found: `id` exact, `agent` by the kind's 1:1 pairing; null when unmatched. */
+  pairing: 'id' | 'agent' | null
+  /** The matched process group, for an `agent` pairing. Id matches are re-resolved by id at close. */
+  matchedPid: number | null
+  matchedPgid: number | null
+  /** Why the process could not be judged, or how a pairing was made; null when nothing is to say. */
+  processNote: string | null
 }
 
 export type WorkspaceRow = {
@@ -65,7 +74,7 @@ export type CloseOutcome = {
   code?: string
   message?: string
   terminalId?: string
-  /** The `--resume=` id of the process that was found. */
+  /** The conversation id the process answered to; absent when the match was by agent kind. */
   sessionUuid?: string
   pid?: number
   pgid?: number
@@ -104,9 +113,18 @@ declare module 'orca' {
       input: { refreshTitles?: boolean }
       output: SessionSnapshot
     }
-    /** Stops one session; only a `done` session is accepted. */
+    /**
+     * Stops one session; only a `done` session is accepted. `pid` is the process an id-less
+     * agent's row was paired to; the worker re-reads the pairing before signalling it.
+     */
     'sessions.close': {
-      input: { workspaceId: string; sessionId?: string | null; terminalId?: string | null; dryRun?: boolean }
+      input: {
+        workspaceId: string
+        sessionId?: string | null
+        terminalId?: string | null
+        pid?: number | null
+        dryRun?: boolean
+      }
       output: CloseOutcome
     }
     /** Closes every session in `workspaceId` whose state is `done`, one at a time. */
