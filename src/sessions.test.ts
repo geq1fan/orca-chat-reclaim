@@ -1,6 +1,6 @@
 import { assert, test } from 'orca/testing'
 import type { SessionRow, SessionSnapshot } from './protocol'
-import { groupSessions, mostRecentIdle, selectDone, selectIdle } from './sessions'
+import { groupSessions, selectDone, selectIdle } from './sessions'
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -13,20 +13,21 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     state: 'done',
     stateStartedAt: 1000,
     sessionId: 'session-1',
-    hasProcess: null,
+    process: null,
+    matchedId: null,
     ...overrides
   }
 }
 
-test('selectIdle keeps finished sessions this plugin can address', () => {
+test('selectIdle keeps finished sessions that have a terminal or a matched process', () => {
   const sessions = [
     row({ terminalId: 'done-1', sessionId: null }),
-    row({ terminalId: null, sessionId: 'chat-1' }),
-    row({ terminalId: null, sessionId: 'chat-exited', hasProcess: false }),
-    row({ terminalId: null, sessionId: null }),
+    row({ terminalId: null, sessionId: 'chat-1', process: 'running', matchedId: 'chat-1' }),
+    // Ids exist but none matched: not a licence to guess, and nothing to signal.
+    row({ terminalId: null, sessionId: 'chat-unknown', process: 'unknown' }),
+    row({ terminalId: null, sessionId: null, process: 'stopped' }),
     row({ terminalId: 'working-1', state: 'working' }),
-    row({ terminalId: 'blocked-1', state: 'blocked' }),
-    row({ terminalId: 'waiting-1', state: 'waiting' }),
+    row({ terminalId: null, sessionId: 'working-chat', process: 'running', state: 'working' }),
     row({ terminalId: 'other-workspace', workspaceId: 'w2' })
   ]
   assert.deepEqual(
@@ -38,8 +39,8 @@ test('selectIdle keeps finished sessions this plugin can address', () => {
 
 test('selectDone counts finished chats that have no terminal too', () => {
   const sessions = [
-    row({ terminalId: null, sessionId: 'chat-1' }),
-    row({ terminalId: null, sessionId: 'chat-2', state: 'working' }),
+    row({ terminalId: null, sessionId: 'chat-1', process: 'running' }),
+    row({ terminalId: null, sessionId: 'chat-2', process: 'running', state: 'working' }),
     row({ terminalId: 'done-1' })
   ]
   assert.deepEqual(
@@ -67,8 +68,7 @@ test('groupSessions puts the focused workspace first and drops empty ones', () =
     currentWorkspaceId: 'w2',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
-    currentSessionId: null
+    recentOps: []
   }
   const groups = groupSessions(snapshot)
   assert.deepEqual(
@@ -80,33 +80,8 @@ test('groupSessions puts the focused workspace first and drops empty ones', () =
     [1, 2]
   )
 })
-test('selectIdle never takes the chat the panel is in, nor a working one', () => {
-  const sessions = [
-    row({ terminalId: 'current', sessionId: 'provider-current' }),
-    row({ terminalId: 'other' }),
-    row({ terminalId: 'busy', state: 'working' })
-  ]
 
-  assert.deepEqual(
-    selectIdle(sessions, 'w1', 'provider-current').map((session) => session.terminalId),
-    ['other']
-  )
-})
-
-test('mostRecentIdle is the newest finished chat that still has a process', () => {
-  const sessions = [
-    row({ terminalId: null, sessionId: 'old', stateStartedAt: 100, hasProcess: true }),
-    row({ terminalId: null, sessionId: 'new', stateStartedAt: 300, hasProcess: true }),
-    row({ terminalId: null, sessionId: 'busy', state: 'working', stateStartedAt: 400 }),
-    row({ terminalId: null, sessionId: 'dead', stateStartedAt: 500, hasProcess: false }),
-    row({ terminalId: 'terminal', stateStartedAt: 600 })
-  ]
-
-  assert.equal(mostRecentIdle(sessions, 'w1')?.sessionId, 'new')
-  assert.equal(mostRecentIdle(sessions, 'w2'), null)
-})
-
-test('groupSessions puts focused workspace first, then active workspaces, then stopped-only', () => {
+test('groupSessions puts focused first, then active, then workspaces with no running session', () => {
   const snapshot: SessionSnapshot = {
     workspaces: [
       { id: 'stopped-1', name: '已停一', kind: 'folder', terminalCount: 0 },
@@ -116,17 +91,16 @@ test('groupSessions puts focused workspace first, then active workspaces, then s
       { id: 'active-2', name: '运行二', kind: 'folder', terminalCount: 0 }
     ],
     sessions: [
-      row({ workspaceId: 'stopped-1', terminalId: null, hasProcess: false }),
-      row({ workspaceId: 'active-1', terminalId: 't1', hasProcess: null }),
-      row({ workspaceId: 'stopped-2', terminalId: null, hasProcess: false }),
-      row({ workspaceId: 'focused-stopped', terminalId: null, hasProcess: false }),
-      row({ workspaceId: 'active-2', terminalId: null, hasProcess: true })
+      row({ workspaceId: 'stopped-1', terminalId: null, process: 'unknown' }),
+      row({ workspaceId: 'active-1', terminalId: 't1', process: null }),
+      row({ workspaceId: 'stopped-2', terminalId: null, process: 'stopped' }),
+      row({ workspaceId: 'focused-stopped', terminalId: null, process: 'unknown' }),
+      row({ workspaceId: 'active-2', terminalId: null, process: 'running' })
     ],
     currentWorkspaceId: 'focused-stopped',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
-    currentSessionId: null
+    recentOps: []
   }
 
   assert.deepEqual(

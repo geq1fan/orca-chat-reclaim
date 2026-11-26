@@ -3,6 +3,7 @@ import { afterEach, assert, beforeEach, hostError, mockHost, mountWorker, test }
 import * as main from './worker'
 import { useSignalOps, useTitleOps } from './worker'
 import type { ChatTitleOps } from './botChats'
+import type { SessionRecord } from './sessionRecord'
 import type { SignalOps } from './sessionProcess'
 
 afterEach(() => {
@@ -16,8 +17,7 @@ beforeEach(() => {
   fakeOps('')
   useTitleOps({
     bots: async () => [],
-    chats: async () => [],
-    sessionPairs: async () => []
+    chats: async () => []
   })
 })
 
@@ -58,19 +58,22 @@ function chat(sessionId: string, overrides: Record<string, unknown> = {}) {
   return agent(null, { title: null, sessionId, ...overrides })
 }
 
-function processTable(entries: { pid: number; resume: string; pgid?: number }[]): string {
+function processTable(
+  entries: { pid: number; resume: string; pgid?: number; flag?: 'resume' | 'session-id' }[]
+): string {
   const rows = entries.map(
-    ({ pid, resume, pgid }) => `${pid} 800 ${pgid ?? pid} ${CLAUDE} --resume=${resume}\n`
+    ({ pid, resume, pgid, flag }) =>
+      `${pid} 800 ${pgid ?? pid} ${CLAUDE} --${flag ?? 'resume'}=${resume}\n`
   )
   return `  PID  PPID  PGID COMMAND\n800 700 800 ${PROVIDER} --cli-input-fd7 1000 3000 -- ${CLAUDE}\n${rows.join('')}`
 }
 
 /** Installs fake process side effects; returns the pgids they were signalled with. */
-function fakeOps(table: string, psError?: string): number[] {
+function fakeOps(table: string, psError?: string, records: SessionRecord[] = []): number[] {
   const signalled: number[] = []
   let clock = 0
   const ops: SignalOps = {
-    readHandleChain: async () => null,
+    listSessionRecords: async () => records,
     listProcesses: async () => {
       if (psError) throw new Error(psError)
       return table
@@ -90,15 +93,14 @@ function fakeOps(table: string, psError?: string): number[] {
 }
 
 /** Chat titles that the fake CLI hands back, plus how often each bot was asked. */
-function fakeTitles(titles: Record<string, string>, pairs: { sessionId: string; nativeId: string }[] = []) {
+function fakeTitles(titles: Record<string, string>) {
   const asked: string[] = []
   const ops: ChatTitleOps = {
     bots: async () => ['小小'],
     chats: async (bot) => {
       asked.push(bot)
       return Object.entries(titles).map(([id, title]) => ({ id, title }))
-    },
-    sessionPairs: async () => pairs
+    }
   }
   useTitleOps(ops)
   return asked
@@ -156,13 +158,14 @@ test('sessions.list reads every workspace and returns the recent ops', async () 
       ['w3', 't3', 'done']
     ]
   )
-  // A chat with no title falls back to its session id, and the list says whether its process
-  // is still alive so a history leftover can be greyed before anyone clicks it.
+  // A chat with no title falls back to its session id, and the list says which id its process
+  // answered to.
   assert.equal(snapshot.sessions[2]?.title, '会话 39e65ad8')
   assert.equal(snapshot.sessions[2]?.sessionId, S1)
-  assert.equal(snapshot.sessions[2]?.hasProcess, true)
-  // Terminal-backed sessions do not need a provider process to be closed.
-  assert.equal(snapshot.sessions[0]?.hasProcess, null)
+  assert.equal(snapshot.sessions[2]?.matchedId, S1)
+  assert.equal(snapshot.sessions[2]?.process, 'running')
+  // Terminal-backed sessions are addressed by their terminal, not by a provider process.
+  assert.equal(snapshot.sessions[0]?.process, null)
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })
@@ -274,8 +277,7 @@ test('closes a terminal-backed session through the terminal API', async () => {
   await worker.deactivate()
 })
 
-test('sessions.reclaim skips the chat the panel is in and closes the rest', async () => {
-  // S1 went idle most recently, so it is the chat the owner is in and must survive.
+test('sessions.reclaim closes every finished session with a matched process, and no working one', async () => {
   const host = hostWith([
     chat(S1, { stateStartedAt: 3000 }),
     chat(S2, { state: 'working', stateStartedAt: 4000 }),
@@ -293,16 +295,18 @@ test('sessions.reclaim skips the chat the panel is in and closes the rest', asyn
 
   assert.deepEqual(
     result.outcomes.map((outcome) => [outcome.sessionId, outcome.ok]),
-    [[S3, true]]
+    [
+      [S1, true],
+      [S3, true]
+    ]
   )
-  assert.deepEqual(result.skipped, { sessionId: S1, title: '会话 39e65ad8' })
   assert.equal(result.stoppedAtFailure, false)
-  assert.deepEqual(signalled, [902])
+  assert.deepEqual(signalled, [900, 902])
   await worker.deactivate()
 })
 
 test('sessions.reclaim stops at the first refusal', async () => {
-  // S1 is the owner's chat (newest); S2 exists but is not its own group leader.
+  // S2 exists but is not its own group leader, so it is refused and the rest is left alone.
   const host = hostWith([
     chat(S1, { stateStartedAt: 3000 }),
     chat(S2, { stateStartedAt: 1000 }),
@@ -319,34 +323,50 @@ test('sessions.reclaim stops at the first refusal', async () => {
 
   const result = await worker.request('sessions.reclaim', { workspaceId: 'w1' })
 
-  assert.equal(result.outcomes.length, 1)
-  assert.equal(result.outcomes[0]?.ok, false)
-  assert.equal(result.outcomes[0]?.code, 'not_group_leader')
+  assert.deepEqual(
+    result.outcomes.map((outcome) => [outcome.sessionId, outcome.ok]),
+    [
+      [S1, true],
+      [S2, false]
+    ]
+  )
+  assert.equal(result.outcomes[1]?.code, 'not_group_leader')
   assert.equal(result.stoppedAtFailure, true)
-  assert.deepEqual(result.skipped, { sessionId: S1, title: '会话 39e65ad8' })
-  assert.deepEqual(signalled, [])
+  assert.deepEqual(signalled, [900])
   await worker.deactivate()
 })
-test('sessions.list marks a chat whose process already exited', async () => {
+test('a chat whose ids matched no process is 无法判定, not 未运行', async () => {
   const host = hostWith([chat(S1), chat(S2)])
   fakeOps(processTable([{ pid: 900, resume: S1 }]))
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list')
 
-  assert.equal(snapshot.sessions[0]?.hasProcess, true)
-  assert.equal(snapshot.sessions[1]?.hasProcess, false)
+  assert.equal(snapshot.sessions[0]?.process, 'running')
+  assert.equal(snapshot.sessions[1]?.process, 'unknown')
   await worker.deactivate()
 })
 
-test('sessions.list leaves hasProcess unknown when ps cannot be read', async () => {
+test('a chat with no candidate id is confirmed 未运行', async () => {
+  const host = hostWith([agent(null, { title: null, sessionId: null })])
+  fakeOps(processTable([]))
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  assert.equal(snapshot.sessions[0]?.process, 'stopped')
+  await worker.deactivate()
+})
+
+test('sessions.list leaves the process unknown when ps cannot be read', async () => {
   const host = hostWith([chat(S1)])
   fakeOps('', 'ps: operation not permitted')
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list')
 
-  assert.equal(snapshot.sessions[0]?.hasProcess, null)
+  assert.equal(snapshot.sessions[0]?.process, 'unknown')
+  assert.equal(snapshot.sessions[0]?.matchedId, null)
   assert.deepEqual(snapshot.sessions.map((session) => session.sessionId), [S1])
   await worker.deactivate()
 })
@@ -372,11 +392,16 @@ test('sessions.list shows the chat title from the bot list and caches it for a m
 
 test('a title found under the Orca session id lands on the provider id row', async () => {
   const host = hostWith([chat(S1)])
-  fakeTitles({ 'orca-session-1': '上线单 13703928' }, [{ sessionId: 'orca-session-1', nativeId: S1 }])
+  fakeOps(processTable([{ pid: 900, resume: S1 }]), undefined, [
+    { sessionId: 'orca-session-1', chainIds: [S1] }
+  ])
+  fakeTitles({ 'orca-session-1': '上线单 13703928' })
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list', {})
 
+  // The row shows the id the process answered to, and that same id found the title.
+  assert.equal(snapshot.sessions[0]?.matchedId, S1)
   assert.equal(snapshot.sessions[0]?.title, '上线单 13703928')
   await worker.deactivate()
 })
@@ -387,8 +412,7 @@ test('an unreadable title source keeps the id prefix and does not break the list
     bots: async () => {
       throw new Error('orca: command not found')
     },
-    chats: async () => [],
-    sessionPairs: async () => []
+    chats: async () => []
   })
   const worker = await mountWorker(main, { host })
 
@@ -407,7 +431,88 @@ test('a chat Orca restored without a provider id is 未运行 and never named af
 
   assert.equal(snapshot.sessions[0]?.title, '未命名会话')
   assert.equal(snapshot.sessions[0]?.sessionId, null)
-  assert.equal(snapshot.sessions[0]?.hasProcess, false)
-  assert.equal(snapshot.currentSessionId, null)
+  assert.equal(snapshot.sessions[0]?.process, 'stopped')
+  await worker.deactivate()
+})
+
+test('maps four live sessions one to one, even when Orca reports an older id', async () => {
+  // The real ids from the host: Home's row carries the provider id; the coordinator's row carries
+  // the Orca session id; 未匹配到题目问题排查's row still carries the pre-rewind provider id.
+  const HOME_ORCA = '87cea74d-887c-465a-a052-1040892904bb'
+  const HOME_NATIVE = 'dd411755-4b8d-4ebc-b89f-9ef38d089774'
+  const COORD_ORCA = '69af17fc-fe61-4578-a2b4-f37f364c31cd'
+  const COORD_NATIVE = '82092408-37fb-4ae5-bf44-83d986eb1e14'
+  const SEARCH_ORCA = 'fb001612-9c34-463e-9dd2-2dcb6441a2d1'
+  const SEARCH_OLD = '9b127c4f-5f06-4157-8d86-c8fe4793719e'
+  const SEARCH_NATIVE = '600d75f6-dbf4-44e5-bb55-9c35e614370b'
+  const DEPLOY_ORCA = '793c26bb-2854-41a0-a0ef-1ae2346c7218'
+  const DEPLOY_NATIVE = '13d8d80f-16b4-4ba3-b3a3-89df1d3e8bc4'
+
+  const host = mockHost({
+    results: {
+      'workspace.list': { workspaces: [workspace('w1', '小小', 0)], truncated: false },
+      'workspace.readContext': context,
+      'agents.list': {
+        agents: [
+          chat(HOME_NATIVE, { stateStartedAt: 3000 }),
+          chat(COORD_ORCA, { stateStartedAt: 2000 }),
+          chat(SEARCH_OLD, { stateStartedAt: 1000 }),
+          chat(DEPLOY_NATIVE, { stateStartedAt: 500 })
+        ]
+      }
+    }
+  })
+  fakeOps(
+    processTable([
+      { pid: 900, resume: COORD_NATIVE },
+      { pid: 901, resume: SEARCH_NATIVE },
+      { pid: 902, resume: HOME_NATIVE },
+      { pid: 903, resume: DEPLOY_NATIVE, flag: 'session-id' }
+    ]),
+    undefined,
+    [
+      { sessionId: HOME_ORCA, chainIds: [HOME_NATIVE] },
+      { sessionId: COORD_ORCA, chainIds: ['39e65ad8-b388-4e57-8d80-e3ad8dc791e8', COORD_NATIVE] },
+      { sessionId: SEARCH_ORCA, chainIds: [SEARCH_OLD, SEARCH_NATIVE] },
+      { sessionId: DEPLOY_ORCA, chainIds: [DEPLOY_NATIVE] }
+    ]
+  )
+  fakeTitles({
+    [HOME_ORCA]: 'Home',
+    [COORD_ORCA]: '分析当前 Mac 内存占用',
+    [SEARCH_ORCA]: '未匹配到题目问题排查',
+    [DEPLOY_ORCA]: '上线 dsl-hub 的 engine 与 controller 更新'
+  })
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list', {})
+  const rows = snapshot.sessions.map((session) => ({
+    rowId: session.sessionId,
+    matchedId: session.matchedId,
+    title: session.title,
+    process: session.process
+  }))
+
+  assert.deepEqual(rows, [
+    { rowId: HOME_NATIVE, matchedId: HOME_NATIVE, title: 'Home', process: 'running' },
+    { rowId: COORD_ORCA, matchedId: COORD_NATIVE, title: '分析当前 Mac 内存占用', process: 'running' },
+    { rowId: SEARCH_OLD, matchedId: SEARCH_NATIVE, title: '未匹配到题目问题排查', process: 'running' },
+    { rowId: DEPLOY_NATIVE, matchedId: DEPLOY_NATIVE, title: '上线 dsl-hub 的 engine 与 controller 更新', process: 'running' }
+  ])
+  // No title crossed onto a process it does not belong to.
+  assert.equal(rows.filter((row) => row.title === 'Home').length, 1)
+  assert.equal(rows.filter((row) => row.title === '分析当前 Mac 内存占用').length, 1)
+  await worker.deactivate()
+})
+
+test('a chat never takes the host agent title as its title', async () => {
+  // `agents.list.title` may carry the bot's name for chats; it is not the conversation title.
+  const host = hostWith([agent(null, { title: '小小', sessionId: S1 })])
+  fakeOps('')
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list', {})
+
+  assert.equal(snapshot.sessions[0]?.title, '会话 39e65ad8')
   await worker.deactivate()
 })

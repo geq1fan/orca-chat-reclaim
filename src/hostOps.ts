@@ -4,12 +4,11 @@ import { execFile } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ChatTitleOps } from './botChats'
+import type { SessionRecord } from './sessionRecord'
+import { chainSessionIds } from './sessionRecord'
 import type { SignalOps } from './sessionProcess'
 
 const DB_PATH = join(homedir(), 'Library', 'Application Support', 'orca', 'agent-session-domain.db')
-
-/** A session id is interpolated into SQL, so it must look like one. */
-const SESSION_ID = /^[0-9a-zA-Z-]{8,64}$/
 
 function run(file: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -58,33 +57,30 @@ export function createChatTitleOps(): ChatTitleOps {
           ? [{ id: chat.id, title: chat.title }]
           : []
       )
-    },
-    async sessionPairs() {
-      const output = await run('sqlite3', [
-        '-readonly',
-        `file:${DB_PATH}?mode=ro`,
-        'select session_id, adopted_native_id from agent_session_records where adopted_native_id is not null;'
-      ])
-      const pairs: { sessionId: string; nativeId: string }[] = []
-      for (const line of output.split('\n')) {
-        const [sessionId, nativeId] = line.split('|')
-        if (sessionId && nativeId) pairs.push({ sessionId, nativeId })
-      }
-      return pairs
     }
   }
 }
 
 export function createSignalOps(): SignalOps {
   return {
-    async readHandleChain(sessionId) {
-      if (!SESSION_ID.test(sessionId)) throw new Error(`会话 id 形态不对：${sessionId}`)
-      // Only the chain is selected: a record can be over a megabyte, and the chain is the part
-      // that names the provider's own conversation id.
-      const sql = `select json_extract(record_json,'$.providerHandleChain') from agent_session_records where session_id='${sessionId}';`
-      const output = await run('sqlite3', ['-readonly', `file:${DB_PATH}?mode=ro`, sql])
-      const line = output.trim().split('\n')[0] ?? ''
-      return line.length > 0 && line !== 'null' ? line : null
+    async listSessionRecords() {
+      // One read for the whole snapshot: every stored session's Orca id and the conversation
+      // ids in its handle chain. Only the chain is selected; a record can be over a megabyte.
+      const output = await run('sqlite3', [
+        '-readonly',
+        '-json',
+        `file:${DB_PATH}?mode=ro`,
+        "select session_id, json_extract(record_json,'$.providerHandleChain') as chain from agent_session_records;"
+      ])
+      const rows = parseJson<{ session_id?: unknown; chain?: unknown }[]>(output)
+      if (!Array.isArray(rows)) return []
+      const records: SessionRecord[] = []
+      for (const row of rows) {
+        if (typeof row.session_id !== 'string' || row.session_id.length === 0) continue
+        const chain = typeof row.chain === 'string' ? row.chain : null
+        records.push({ sessionId: row.session_id, chainIds: chainSessionIds(chain) })
+      }
+      return records
     },
     listProcesses: () => run('ps', ['-Ao', 'pid,ppid,pgid,command']),
     signalGroup: (pgid) => {

@@ -45,6 +45,17 @@ export function hasClaudeProcess(rows: readonly PsRow[], providerId: string): bo
   return rows.some((row) => isClaudeRow(row, flag))
 }
 
+/**
+ * The first candidate id a live claude process carries, or null when none of them does. A row's
+ * candidates are every id its session may run under, so a stale id does not hide a live one.
+ */
+export function findRunningProcessId(rows: readonly PsRow[], candidates: readonly string[]): string | null {
+  for (const id of candidates) {
+    if (hasClaudeProcess(rows, id)) return id
+  }
+  return null
+}
+
 export type ClaudeTarget = {
   pid: number
   ppid: number
@@ -124,4 +135,47 @@ export function findClaudeTarget(
       parentCommand: parent.command
     }
   }
+}
+
+type TargetRefusal = Extract<TargetLookup, { ok: false }>
+
+export type CandidateTarget =
+  | { ok: true; target: ClaudeTarget; providerId: string }
+  | { ok: false; code: TargetRefusal['code']; message: string }
+
+/**
+ * The one claude process that runs any of a session's candidate ids. Safety checks are the same
+ * as `findClaudeTarget`; when two candidates each name a live process, either one would be a
+ * guess, so the lookup refuses instead of picking.
+ */
+export function findClaudeTargetAmong(
+  rows: readonly PsRow[],
+  candidates: readonly string[],
+  ownPgid: number | null = null
+): CandidateTarget {
+  const refusals: Extract<TargetLookup, { ok: false }>[] = []
+  let matched: { target: ClaudeTarget; providerId: string } | null = null
+
+  for (const id of candidates) {
+    const found = findClaudeTarget(rows, id, ownPgid)
+    if (!found.ok) {
+      refusals.push(found)
+      continue
+    }
+    if (matched && matched.target.pid !== found.target.pid) {
+      return {
+        ok: false,
+        code: 'ambiguous',
+        message: `两个候选 id 各命中一个进程（pid ${matched.target.pid}、${found.target.pid}），不敢猜要杀哪一个`
+      }
+    }
+    matched ??= { target: found.target, providerId: id }
+  }
+
+  if (matched) return { ok: true, ...matched }
+  // A safety refusal says more than "no process": surface it before the plain miss.
+  const informative = refusals.find((refusal) => refusal.code !== 'no_process')
+  const refusal = informative ?? refusals[0]
+  if (refusal) return { ok: false, code: refusal.code, message: refusal.message }
+  return { ok: false, code: 'no_process', message: '没有找到运行中的进程' }
 }

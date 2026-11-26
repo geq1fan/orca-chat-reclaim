@@ -1,4 +1,5 @@
 import { assert, test } from 'orca/testing'
+import type { SessionRecord } from './sessionRecord'
 import { stopSessionWithSignal, TERM_WAIT_MS, type SignalOps } from './sessionProcess'
 
 const CLAUDE = '/Users/me/.local/bin/claude'
@@ -33,20 +34,20 @@ function processTable(
 
 function fakeOps(options: {
   table?: string
-  chain?: string | null
-  chainError?: string
+  records?: SessionRecord[]
+  recordsError?: string
   neverDies?: boolean
   ownPgid?: number | null
-}): { ops: SignalOps; signalled: number[]; chainReads: () => number } {
+}): { ops: SignalOps; signalled: number[]; recordReads: () => number } {
   const signalled: number[] = []
   const neverDies = options.neverDies === true
   let clock = 0
-  let chainReads = 0
+  let recordReads = 0
   const ops: SignalOps = {
-    readHandleChain: async () => {
-      chainReads += 1
-      if (options.chainError) throw new Error(options.chainError)
-      return options.chain ?? null
+    listSessionRecords: async () => {
+      recordReads += 1
+      if (options.recordsError) throw new Error(options.recordsError)
+      return options.records ?? []
     },
     listProcesses: async () => options.table ?? '',
     signalGroup: (pgid) => {
@@ -59,7 +60,7 @@ function fakeOps(options: {
       clock += ms
     }
   }
-  return { ops, signalled, chainReads: () => chainReads }
+  return { ops, signalled, recordReads: () => recordReads }
 }
 
 test('signals the process group of the claude that resumes the session', async () => {
@@ -97,7 +98,7 @@ test('matches a claude started with --session-id, the flag new conversations use
 })
 
 test('does not signal when no claude process carries the session id', async () => {
-  const { ops, signalled, chainReads } = fakeOps({ table: processTable('another-session') })
+  const { ops, signalled, recordReads } = fakeOps({ table: processTable('another-session') })
 
   const outcome = await stopSessionWithSignal({
     workspaceId: 'w1',
@@ -110,16 +111,19 @@ test('does not signal when no claude process carries the session id', async () =
   assert.equal(outcome.code, 'no_process')
   assert.match(outcome.message ?? '', /--resume= 和 --session-id=/)
   assert.deepEqual(signalled, [])
-  // The stored record was consulted only after the direct pass found nothing.
-  assert.equal(chainReads(), 1)
+  // The chain is part of every lookup: the row id alone may be stale.
+  assert.equal(recordReads(), 1)
 })
 
-test('does not read the session database when the id already matches a process', async () => {
-  const { ops, chainReads } = fakeOps({ table: processTable(SESSION_ID) })
+test('reads the handle chain once even when the row id already matches a process', async () => {
+  const { ops, recordReads } = fakeOps({
+    table: processTable(SESSION_ID),
+    records: [{ sessionId: 'orcasession-0000-1111', chainIds: [SESSION_ID] }]
+  })
 
   await stopSessionWithSignal({ workspaceId: 'w1', sessionId: SESSION_ID, dryRun: true, ops })
 
-  assert.equal(chainReads(), 0)
+  assert.equal(recordReads(), 1)
 })
 
 test('refuses a claude process that is not its own process group', async () => {
@@ -201,14 +205,10 @@ test('a dry run reports the process and signals nothing', async () => {
   assert.deepEqual(signalled, [])
 })
 
-test('falls back to the stored session record when the id is Orca’s own', async () => {
-  const chain = JSON.stringify([
-    { provider: 'claude', handle: { sessionId: 'older-session' } },
-    { provider: 'claude', handle: { sessionId: SESSION_ID } }
-  ])
+test('falls back to the stored handle chain when the row id is Orca’s own', async () => {
   const { ops, signalled } = fakeOps({
     table: processTable(SESSION_ID),
-    chain
+    records: [{ sessionId: 'orcasession-0000-1111', chainIds: ['older-session', SESSION_ID] }]
   })
 
   const outcome = await stopSessionWithSignal({
@@ -224,7 +224,7 @@ test('falls back to the stored session record when the id is Orca’s own', asyn
 })
 
 test('an unreadable session database is named in the refusal', async () => {
-  const { ops } = fakeOps({ table: '', chainError: 'database is locked' })
+  const { ops } = fakeOps({ table: '', recordsError: 'database is locked' })
 
   const outcome = await stopSessionWithSignal({
     workspaceId: 'w1',

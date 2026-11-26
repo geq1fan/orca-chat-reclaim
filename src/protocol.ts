@@ -3,6 +3,9 @@ export {}
 
 export type AgentState = 'working' | 'blocked' | 'waiting' | 'done'
 
+/** What `ps` says about a chat session's process; see `SessionRow.process`. */
+export type ProcessState = 'running' | 'unknown' | 'stopped'
+
 /** One agent session as `agents.list` reports it, tagged with the workspace it lives in. */
 export type SessionRow = {
   workspaceId: string
@@ -19,11 +22,17 @@ export type SessionRow = {
   stateStartedAt: number
   sessionId: string | null
   /**
-   * Whether a live claude process carries this session's id (both `--session-id=` and
-   * `--resume=` count). Null for terminal-backed sessions and when the process table could not
-   * be read, so the panel only greys a button when it knows there is nothing to close.
+   * The process side of a chat session: `running` when a live claude carries one of its candidate
+   * ids (both `--session-id=` and `--resume=` count), `unknown` when it has ids but none of them
+   * matched (or `ps` could not be read), `stopped` only when it has no id a process could carry.
+   * Null for terminal-backed sessions, which are addressed by their terminal instead.
    */
-  hasProcess: boolean | null
+  process: ProcessState | null
+  /**
+   * The candidate id whose claude process matched. The row shows this id, and looks its title up
+   * by the same id, so a rewind cannot pair one conversation's title with another's process.
+   */
+  matchedId: string | null
 }
 
 export type WorkspaceRow = {
@@ -43,11 +52,6 @@ export type SessionSnapshot = {
   failedWorkspaces: number
   /** The newest first: what this plugin last tried to close, and how it went. */
   recentOps: OpRecord[]
-  /**
-   * The chat this panel's user is most likely in — the newest to go idle in the focused
-   * workspace. 「回收空闲」 never closes it.
-   */
-  currentSessionId: string | null
 }
 
 export type CloseOutcome = {
@@ -88,8 +92,6 @@ export type ReclaimResult = {
   outcomes: CloseOutcome[]
   /** True when a close failed and the remaining idle sessions were left alone. */
   stoppedAtFailure: boolean
-  /** The chat that was left alone because it is the one the panel's user is in. */
-  skipped: { sessionId: string; title: string } | null
 }
 
 declare module 'orca' {

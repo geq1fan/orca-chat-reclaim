@@ -6,10 +6,11 @@ import { buildTitleMap, type ChatTitleOps } from './botChats'
 import { messageOf } from './errors'
 import { createChatTitleOps, createSignalOps } from './hostOps'
 import { AGENT_STATE_LABEL } from './labels'
-import type { CloseOutcome, OpRecord, ReclaimResult, SessionRow, SessionSnapshot } from './protocol'
-import { hasClaudeProcess, parseProcessTable, type PsRow } from './processTable'
+import type { CloseOutcome, OpRecord, ProcessState, ReclaimResult, SessionRow, SessionSnapshot } from './protocol'
+import { findRunningProcessId, parseProcessTable, type PsRow } from './processTable'
+import { aliasTitles, sessionCandidates, type SessionRecord } from './sessionRecord'
 import { stopSessionWithSignal, type SignalOps } from './sessionProcess'
-import { mostRecentIdle, selectIdle } from './sessions'
+import { selectIdle } from './sessions'
 
 /** How many `agents.list` calls are in flight at once. 127 workspaces one by one is slow. */
 const BATCH = 8
@@ -51,9 +52,10 @@ export function useTitleOps(replaced: ChatTitleOps | null): void {
 type TitleCache = { at: number; titles: Record<string, string> }
 
 /**
- * Titles for chat sessions, keyed by either id a row may carry. `refresh` rebuilds from the CLI
- * (the 刷新 button and every refresh after a close); otherwise a cache younger than a minute is
- * enough, since a full rebuild asks every bot and takes about a second.
+ * Chat titles keyed by Orca session id. `refresh` rebuilds from the CLI (the 刷新 button and every
+ * refresh after a close); otherwise a cache younger than a minute is enough, since a full rebuild
+ * asks every bot and takes about a second. Record aliases are applied per snapshot, because a
+ * rewind can add a new conversation id at any time.
  */
 async function loadTitles(orca: OrcaWorkerApi, refresh: boolean): Promise<Record<string, string>> {
   let cached: TitleCache | null = null
@@ -93,17 +95,20 @@ async function loadTitles(orca: OrcaWorkerApi, refresh: boolean): Promise<Record
   return fresh
 }
 
-function sessionLabel(agent: {
+/** Terminal panes carry their own title; a chat's title comes only from the chat-title table. */
+function terminalLabel(agent: {
   title?: string | null
   task?: { title: string } | null
-  agent?: string | null
   sessionId?: string | null
 }): string {
   if (agent.title) return agent.title
   if (agent.task?.title) return agent.task.title
   if (agent.sessionId) return `会话 ${agent.sessionId.slice(0, 8)}`
-  // The agent's own name says nothing about which conversation this is, and Orca gave no id.
   return '未命名会话'
+}
+
+function idLabel(id: string | null): string {
+  return id ? `会话 ${id.slice(0, 8)}` : '未命名会话'
 }
 
 async function readOps(orca: OrcaWorkerApi): Promise<OpRecord[]> {
@@ -126,7 +131,25 @@ async function recordOp(orca: OrcaWorkerApi, entry: OpRecord): Promise<void> {
 async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promise<SessionSnapshot> {
   const listed = await orca.host.call('workspace.list', { includeStatus: true })
   const context = await orca.host.call('workspace.readContext')
-  const titles = await loadTitles(orca, refreshTitles)
+
+  // One read of the session database and one `ps` for the whole list. The database tells a row
+  // every id its process may carry; `ps` says which of them is actually running. Either source
+  // failing leaves the rows it would have answered for unjudged, never "not running".
+  let records: SessionRecord[] = []
+  try {
+    records = await signalOperations().listSessionRecords()
+  } catch {
+    // Without the chain a row can still match on the id it carries; nothing else is claimed.
+    records = []
+  }
+  let processTable: PsRow[] | null = null
+  try {
+    processTable = parseProcessTable(await signalOperations().listProcesses())
+  } catch {
+    processTable = null
+  }
+
+  const titles = aliasTitles(await loadTitles(orca, refreshTitles), records)
 
   const workspaces = listed.workspaces.map((workspace) => ({
     id: workspace.id,
@@ -134,15 +157,6 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
     kind: workspace.kind,
     terminalCount: workspace.status?.terminalCount ?? null
   }))
-
-  // One `ps` for the whole list: it tells the panel which chats still have a live process, so a
-  // history leftover is greyed out before anyone clicks it. A failed read leaves it unknown.
-  let processTable: PsRow[] | null = null
-  try {
-    processTable = parseProcessTable(await signalOperations().listProcesses())
-  } catch {
-    processTable = null
-  }
 
   const sessions: SessionRow[] = []
   let failedWorkspaces = 0
@@ -167,26 +181,48 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
         continue
       }
       for (const agent of agents) {
-        const providerSessionId = agent.sessionId ?? null
+        const rowId = agent.sessionId ?? null
+        const candidates = sessionCandidates(records, rowId)
+        const matchedId =
+          agent.terminalId !== null || processTable === null
+            ? null
+            : findRunningProcessId(processTable, candidates)
+
+        let process: ProcessState | null
+        if (agent.terminalId !== null) {
+          process = null
+        } else if (candidates.length === 0) {
+          // No id a claude process could carry: there is nothing here to run.
+          process = 'stopped'
+        } else if (matchedId) {
+          process = 'running'
+        } else {
+          // Ids exist but none matched (`ps` unreadable, or the process is gone): unjudged,
+          // never reported as "not running".
+          process = 'unknown'
+        }
+
+        // The row shows the id its process answered to, and looks the title up by that same id.
+        const displayId = agent.terminalId !== null ? rowId ?? agent.terminalId : matchedId ?? rowId
+        const title =
+          agent.terminalId !== null
+            ? terminalLabel(agent)
+            : displayId
+              ? (titles[displayId] ?? idLabel(displayId))
+              : '未命名会话'
+
         sessions.push({
           workspaceId: workspace.id,
           workspaceName: workspace.name,
           workspaceKind: workspace.kind,
           terminalId: agent.terminalId,
-          title: (agent.sessionId && titles[agent.sessionId]) || sessionLabel(agent),
+          title,
           agent: agent.agent ?? 'unknown',
           state: agent.state,
           stateStartedAt: agent.stateStartedAt,
-          sessionId: providerSessionId,
-          hasProcess:
-            agent.terminalId !== null
-              ? null
-              : providerSessionId === null
-                ? // A chat pane Orca restored without a provider handle has nothing running.
-                  false
-                : processTable === null
-                  ? null
-                  : hasClaudeProcess(processTable, providerSessionId)
+          sessionId: rowId,
+          process,
+          matchedId
         })
       }
     }
@@ -199,17 +235,13 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
     // The panel simply shows no history when the store cannot be read.
   }
 
-  const focusedWorkspaceId = context?.workspaceId ?? null
-  const current = focusedWorkspaceId ? mostRecentIdle(sessions, focusedWorkspaceId) : null
-
   return {
     workspaces,
     sessions,
-    currentWorkspaceId: focusedWorkspaceId,
+    currentWorkspaceId: context?.workspaceId ?? null,
     workspacesTruncated: listed.truncated,
     failedWorkspaces,
-    recentOps,
-    currentSessionId: current?.sessionId ?? null
+    recentOps
   }
 }
 
@@ -260,7 +292,7 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
     dryRun
   }
   const fallbackTitle = input.sessionId
-    ? `会话 ${input.sessionId.slice(0, 8)}`
+    ? idLabel(input.sessionId)
     : (input.terminalId ?? '会话')
   const fallbackKind: 'terminal' | 'signal' = input.terminalId ? 'terminal' : 'signal'
 
@@ -302,7 +334,7 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
   }
 
   const sessionId = match.sessionId ?? base.sessionId
-  const title = sessionLabel(match)
+  const title = match.terminalId !== null ? terminalLabel(match) : idLabel(sessionId)
   if (match.state !== 'done') {
     return finish(
       {
@@ -351,12 +383,7 @@ async function reclaimIdle(orca: OrcaWorkerApi, workspaceId: string, dryRun: boo
   // Re-read first: the panel's list may be older than what Orca has now, and closing a session
   // that started working again would be the one thing this must never do.
   const snapshot = await readSnapshot(orca, false)
-  // The chat the owner is talking in is never part of a bulk reclaim.
-  const current = mostRecentIdle(snapshot.sessions, workspaceId)
-  const excludedSessionId = current?.sessionId ?? null
-  const idle = selectIdle(snapshot.sessions, workspaceId, excludedSessionId)
-  const skipped: ReclaimResult['skipped'] =
-    current && current.sessionId ? { sessionId: current.sessionId, title: current.title } : null
+  const idle = selectIdle(snapshot.sessions, workspaceId)
   const outcomes: CloseOutcome[] = []
 
   for (const session of idle) {
@@ -369,9 +396,9 @@ async function reclaimIdle(orca: OrcaWorkerApi, workspaceId: string, dryRun: boo
     outcomes.push(outcome)
     // One refusal usually means the machine cannot be driven right now; stop rather than firing
     // the same failed action at every remaining session.
-    if (!outcome.ok) return { outcomes, stoppedAtFailure: true, skipped }
+    if (!outcome.ok) return { outcomes, stoppedAtFailure: true }
   }
-  return { outcomes, stoppedAtFailure: false, skipped }
+  return { outcomes, stoppedAtFailure: false }
 }
 
 export default function activate(orca: OrcaWorkerApi): void {
