@@ -545,7 +545,7 @@ export default function Panel(): OrcaNode {
                 : `将关闭当前工作区「${currentWorkspace?.name ?? currentWorkspaceId}」里 ${idle.length} 个会话：${idle
                     .slice(0, 3)
                     .map((session) => `「${truncateTitle(session.title, 20)}」`)
-                    .join('')}${idle.length > 3 ? ` 等 ${idle.length} 个` : ''}。带终端的走 terminal.close，chat 会话按会话 id（或没有 id 的 agent 的种类配对）定位进程组后发 SIGTERM，进程会随之结束，无法撤销。`}
+                    .join('')}${idle.length > 3 ? ` 等 ${idle.length} 个` : ''}。带终端的走 terminal.close，chat 会话按会话 id（或没有 id 的 agent 按同工作区目录配对）定位进程组后发 SIGTERM，进程会随之结束，无法撤销。`}
             </Text>
             {isStale ? (
               <Text muted size="xs">

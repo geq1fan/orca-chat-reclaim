@@ -38,6 +38,7 @@ function fakeOps(options: {
   recordsError?: string
   neverDies?: boolean
   ownPgid?: number | null
+  cwd?: (pid: number) => string | null
 }): { ops: SignalOps; signalled: number[]; recordReads: () => number } {
   const signalled: number[] = []
   const neverDies = options.neverDies === true
@@ -50,6 +51,7 @@ function fakeOps(options: {
       return options.records ?? []
     },
     listProcesses: async () => options.table ?? '',
+    processCwd: async (pid) => (options.cwd ? options.cwd(pid) : null),
     signalGroup: (pgid) => {
       signalled.push(pgid)
     },
@@ -230,20 +232,90 @@ test('falls back to the stored handle chain when the row id is Orca’s own', as
 })
 
 test('refuses a paired pid that runs another agent kind', async () => {
-  // A count-based pairing must never reach a process of a different agent: pid 900 is claude.
-  const { ops, signalled } = fakeOps({ table: processTable(SESSION_ID) })
+  // A workspace pairing must never reach a process of a different agent: pid 900 is claude.
+  const { ops, signalled } = fakeOps({
+    table: processTable(SESSION_ID),
+    cwd: () => '/tmp/w1'
+  })
 
   const outcome = await stopPairedSession({
     workspaceId: 'w1',
     sessionId: 'orcasession-0000-1111',
     agent: 'antigravity',
     pid: 900,
+    workspacePath: '/tmp/w1',
     dryRun: false,
     ops
   })
 
   assert.equal(outcome.ok, false)
   assert.equal(outcome.code, 'kind_mismatch')
+  assert.deepEqual(signalled, [])
+})
+
+test('a paired close signals when the pid is still in the workspace directory', async () => {
+  const { ops, signalled } = fakeOps({
+    table: processTable(SESSION_ID),
+    cwd: (pid) => (pid === 900 ? '/tmp/w1' : null)
+  })
+
+  const outcome = await stopPairedSession({
+    workspaceId: 'w1',
+    sessionId: 'orcasession-0000-1111',
+    agent: 'claude',
+    pid: 900,
+    workspacePath: '/tmp/w1',
+    dryRun: false,
+    ops
+  })
+
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.pid, 900)
+  assert.deepEqual(signalled, [900])
+})
+
+test('a paired close refuses when the pid cwd left the workspace', async () => {
+  const { ops, signalled } = fakeOps({
+    table: processTable(SESSION_ID),
+    cwd: () => '/tmp/elsewhere'
+  })
+
+  const outcome = await stopPairedSession({
+    workspaceId: 'w1',
+    sessionId: 'orcasession-0000-1111',
+    agent: 'claude',
+    pid: 900,
+    workspacePath: '/tmp/w1',
+    dryRun: false,
+    ops
+  })
+
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'cwd_mismatch')
+  assert.match(outcome.message ?? '', /\/tmp\/elsewhere/)
+  assert.match(outcome.message ?? '', /\/tmp\/w1/)
+  assert.deepEqual(signalled, [])
+})
+
+test('a paired close refuses when the cwd cannot be read', async () => {
+  const { ops, signalled } = fakeOps({
+    table: processTable(SESSION_ID),
+    cwd: () => null
+  })
+
+  const outcome = await stopPairedSession({
+    workspaceId: 'w1',
+    sessionId: 'orcasession-0000-1111',
+    agent: 'claude',
+    pid: 900,
+    workspacePath: '/tmp/w1',
+    dryRun: false,
+    ops
+  })
+
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'cwd_mismatch')
+  assert.match(outcome.message ?? '', /读不到 pid 900 的 cwd/)
   assert.deepEqual(signalled, [])
 })
 

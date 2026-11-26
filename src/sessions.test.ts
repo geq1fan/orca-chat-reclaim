@@ -60,9 +60,9 @@ test('selectDone counts finished chats that have no terminal too', () => {
 test('groupSessions puts the focused workspace first and drops empty ones', () => {
   const snapshot: SessionSnapshot = {
     workspaces: [
-      { id: 'w1', name: '工作区一', kind: 'worktree', terminalCount: 2 },
-      { id: 'w2', name: '工作区二', kind: 'folder', terminalCount: 1 },
-      { id: 'w3', name: '工作区三', kind: 'folder', terminalCount: 0 }
+      { id: 'w1', name: '工作区一', kind: 'worktree', path: null, terminalCount: 2 },
+      { id: 'w2', name: '工作区二', kind: 'folder', path: null, terminalCount: 1 },
+      { id: 'w3', name: '工作区三', kind: 'folder', path: null, terminalCount: 0 }
     ],
     sessions: [
       row({ terminalId: 'a' }),
@@ -88,11 +88,11 @@ test('groupSessions puts the focused workspace first and drops empty ones', () =
 test('groupSessions puts focused first, then active, then workspaces with no running session', () => {
   const snapshot: SessionSnapshot = {
     workspaces: [
-      { id: 'stopped-1', name: '已停一', kind: 'folder', terminalCount: 0 },
-      { id: 'active-1', name: '运行一', kind: 'worktree', terminalCount: 1 },
-      { id: 'stopped-2', name: '已停二', kind: 'folder', terminalCount: 0 },
-      { id: 'focused-stopped', name: '当前停', kind: 'folder', terminalCount: 0 },
-      { id: 'active-2', name: '运行二', kind: 'folder', terminalCount: 0 }
+      { id: 'stopped-1', name: '已停一', kind: 'folder', path: null, terminalCount: 0 },
+      { id: 'active-1', name: '运行一', kind: 'worktree', path: null, terminalCount: 1 },
+      { id: 'stopped-2', name: '已停二', kind: 'folder', path: null, terminalCount: 0 },
+      { id: 'focused-stopped', name: '当前停', kind: 'folder', path: null, terminalCount: 0 },
+      { id: 'active-2', name: '运行二', kind: 'folder', path: null, terminalCount: 0 }
     ],
     sessions: [
       row({ workspaceId: 'stopped-1', terminalId: null, process: 'unknown' }),

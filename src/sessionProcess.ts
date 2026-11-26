@@ -15,6 +15,8 @@ export type SignalOps = {
   listSessionRecords(): Promise<SessionRecord[]>
   /** `ps -Ao pid,ppid,pgid,command` output. */
   listProcesses(): Promise<string>
+  /** `lsof -a -p <pid> -d cwd -Fn`: the process's working directory, or null when unreadable. */
+  processCwd(pid: number): Promise<string | null>
   /** SIGTERM to the whole process group. */
   signalGroup(pgid: number): void
   isAlive(pid: number): boolean
@@ -126,8 +128,9 @@ export async function stopSessionWithSignal(options: {
 /**
  * Stops a chat session of an agent that puts no session id on its command line. The target is
  * the pid its kind was paired to at read time; `findAgentTargetByPid` still refuses anything
- * that is no longer an agent process of exactly that kind, so a stale or mixed-up pairing cannot
- * reach a different agent's process.
+ * that is no longer an agent process of exactly that kind, and the process's cwd must still be
+ * the workspace directory the pairing was made in. A stale or mixed-up pairing therefore cannot
+ * reach a different agent's process or another workspace's.
  */
 export async function stopPairedSession(options: {
   workspaceId: string
@@ -135,10 +138,12 @@ export async function stopPairedSession(options: {
   /** The agent kind the pairing was made for. */
   agent: string
   pid: number
+  /** The workspace directory the pairing used; a changed cwd refuses. */
+  workspacePath: string | null
   dryRun: boolean
   ops: SignalOps
 }): Promise<CloseOutcome> {
-  const { workspaceId, sessionId, agent, pid, dryRun, ops } = options
+  const { workspaceId, sessionId, agent, pid, workspacePath, dryRun, ops } = options
   const base: SignalBase = { workspaceId, sessionId, how: 'signal', dryRun }
 
   const table = await readTable(ops)
@@ -149,6 +154,27 @@ export async function stopPairedSession(options: {
   const ownPgid = await ops.ownPgid().catch(() => null)
   const found = findAgentTargetByPid(table, pid, agent, ownPgid)
   if (!found.ok) return { ...base, ok: false, code: found.code, message: found.message }
+
+  if (workspacePath === null) {
+    return {
+      ...base,
+      ok: false,
+      code: 'workspace_unknown',
+      message: `不知道这个工作区的目录路径，无法确认 pid ${pid} 仍属于它，拒绝`
+    }
+  }
+  const cwd = await ops.processCwd(pid).catch(() => null)
+  if (cwd !== workspacePath) {
+    return {
+      ...base,
+      ok: false,
+      code: 'cwd_mismatch',
+      message:
+        cwd === null
+          ? `读不到 pid ${pid} 的 cwd，无法确认它仍在工作区 ${workspacePath}，拒绝`
+          : `pid ${pid} 的 cwd 现在是 ${cwd}，不再等于工作区路径 ${workspacePath}，拒绝`
+    }
+  }
 
   const detail = { pid: found.target.pid, pgid: found.target.pgid, parentArgs: found.target.parentCommand }
   if (dryRun) return { ...base, ok: true, ...detail }
