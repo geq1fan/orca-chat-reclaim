@@ -372,8 +372,69 @@ const real: SessionSnapshot = {
   ]
 }
 
+/** One row per screenshot: the same slots, with and without a session id the process answered to. */
+const rowWorkspace = { id: 'folder:1', name: '小小', kind: 'folder' as const, terminalCount: 0 }
+
+const withId: SessionSnapshot = {
+  workspaces: [rowWorkspace],
+  sessions: [
+    {
+      workspaceId: 'folder:1',
+      workspaceName: '小小',
+      workspaceKind: 'folder',
+      terminalId: null,
+      title: 'Took over 错题本三期',
+      agent: 'claude',
+      state: 'done',
+      stateStartedAt: Date.now() - 3_600_000,
+      sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+      process: 'running',
+      matchedId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+      pairing: 'id',
+      matchedPid: null,
+      matchedPgid: null,
+      processNote: null
+    }
+  ],
+  currentWorkspaceId: 'folder:1',
+  workspacesTruncated: false,
+  failedWorkspaces: 0,
+  recentOps: []
+}
+
+const withoutId: SessionSnapshot = {
+  workspaces: [rowWorkspace],
+  sessions: [
+    {
+      workspaceId: 'folder:1',
+      workspaceName: '小小',
+      workspaceKind: 'folder',
+      terminalId: null,
+      title: '我想开发一个 orca 插件…',
+      agent: 'antigravity',
+      state: 'done',
+      stateStartedAt: Date.now() - 3_600_000,
+      sessionId: 'b9388fd5-6cae-42ad-9627-0aad35007921',
+      process: 'running',
+      matchedId: null,
+      pairing: 'agent',
+      matchedPid: 8993,
+      matchedPgid: 8993,
+      processNote: 'antigravity 不提供会话 id；本机这种会话 1 个、进程 1 个，1:1 配到 pid 8993（pgid 8993）'
+    }
+  ],
+  currentWorkspaceId: 'folder:1',
+  workspacesTruncated: false,
+  failedWorkspaces: 0,
+  recentOps: []
+}
+
+const rowStorage = { expandedGroups: { 'folder:1': true } }
+
 export default defineCheck({
   real: { requests: { 'sessions.list': real } },
+  withId: { storage: rowStorage, requests: { 'sessions.list': withId } },
+  withoutId: { storage: rowStorage, requests: { 'sessions.list': withoutId } },
   realOpen: {
     storage: { showStopped: true, expandedGroups: {"identity:wt2:local:7072fb48-0d5c-413a-9d3e-f6a4830ae582": true, "identity:wt2:local:aded6ef9-26a9-4d47-9d77-bb5218b60734": true, "folder:f8168b9e-ba71-4fbf-9b41-2b152abde888": true, "folder:cf9721a4-3ce2-410f-87d5-55da80cefb6e": true, "folder:52cc4ad7-ad59-4592-bf32-e6e3fe0734d5": true, "folder:7b3ccc56-eecd-478c-b440-0cf4e5c31d61": true, "folder:9d5ad5ae-bcb1-483e-9d22-290c80b7ce8a": true, "folder:a151ba26-a0a2-4e84-bf64-fcfe9b155cd0": true, "folder:637d87aa-162f-41f8-ba04-b7313fbcd372": true} },
     requests: { 'sessions.list': real }

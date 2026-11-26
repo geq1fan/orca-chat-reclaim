@@ -64,12 +64,25 @@ type DisplayState = { label: string; tone: Tone }
 function displayState(row: SessionRow): DisplayState {
   if (row.process === 'stopped') return { label: '未运行', tone: 'neutral' }
   if (row.process === 'unknown') return { label: '无法判定', tone: 'warning' }
-  // An agent whose CLI takes no session id is matched by kind, not by id: say so in the badge.
-  if (row.pairing === 'agent') return { label: '运行中（无会话 id）', tone: 'accent' }
   if (row.state === 'working') return { label: '运行中', tone: 'accent' }
   if (row.state === 'blocked') return { label: '待确认', tone: 'warning' }
   if (row.state === 'waiting') return { label: '等待中', tone: 'neutral' }
   return { label: '空闲', tone: 'success' }
+}
+
+/**
+ * The row's handle, always in the same slot after the duration: the id its process answered to,
+ * or 「无会话 id · pid N」 for an agent whose CLI carries no id and was paired 1:1 with a process.
+ * A terminal row with no session id falls back to the terminal it addresses.
+ */
+function identityLabel(row: SessionRow): string {
+  if (row.pairing !== 'agent') {
+    const id = row.matchedId ?? row.sessionId
+    if (id !== null) return `会话 ${id.slice(0, 8)}`
+  }
+  if (row.matchedPid !== null) return `无会话 id · pid ${row.matchedPid}`
+  if (row.terminalId !== null) return `终端 ${row.terminalId.slice(0, 8)}`
+  return '无会话 id'
 }
 
 function describe(error: unknown): string {
@@ -213,10 +226,24 @@ function renderRow(row: SessionRow): OrcaNode {
   const closeable = canClose(row)
   /** Why the process is not a close target, when it is not. */
   const unavailable = row.process === 'stopped' ? '未运行' : row.process === 'unknown' ? '无法判定' : null
-  // The same id the title was looked up with: the one the matched process answered to.
-  const shortId = (row.matchedId ?? row.sessionId)?.slice(0, 8) ?? row.terminalId
+  // Every row draws the same slots, in the same order: title / badge, agent, duration, handle.
+  const identity = identityLabel(row)
   const lastResult = read(rowResults)[key]
   const state = displayState(row)
+  // Explanations live in the close button's tooltip; keeping them out of the row makes every row
+  // the same height. A paired agent's 1:1 note and a 无法判定 reason both read here.
+  const closeAction = row.terminalId !== null ? '将关闭关联终端，无法撤销' : '将向进程组发 SIGTERM，无法撤销'
+  const closeTooltip = row.processNote !== null ? `${closeAction}；${row.processNote}` : closeAction
+  const disabledTooltip =
+    row.state !== 'done'
+      ? row.processNote !== null
+        ? `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」；${row.processNote}`
+        : `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」`
+      : row.process === 'unknown'
+        ? (row.processNote ?? '没有进程命中这个会话的候选 id，无法判定它是否还在跑；先刷新确认')
+        : row.process === 'stopped'
+          ? '这个会话没有任何可用 id，也没有进程在跑（未运行）'
+          : '这个会话没有终端也没有 sessionId，没法定位进程'
 
   return (
     <Box direction="column" gap="xs" padding="sm">
@@ -225,9 +252,9 @@ function renderRow(row: SessionRow): OrcaNode {
           <Text size="sm" weight="medium" muted={!isRunning(row)} truncate>
             {truncateTitle(row.title)}
           </Text>
-          <Row gap="xs" align="center" wrap>
+          <Row gap="xs" align="center">
             <Badge tone={state.tone}>{state.label}</Badge>
-            <Text muted size="xs">
+            <Text muted size="xs" truncate>
               {row.agent}
             </Text>
             <Text muted size="xs">
@@ -237,50 +264,18 @@ function renderRow(row: SessionRow): OrcaNode {
               {row.state === 'done' ? '已空闲' : '状态持续'}{' '}
               <RelativeTime at={row.stateStartedAt} format="duration" muted />
             </Text>
-            {shortId ? (
-              <Box direction="row" gap="xs" align="center" shrink={false}>
-                <Text muted size="xs">
-                  ·
-                </Text>
-                <Text muted size="xs">{`会话 ${shortId}`}</Text>
-              </Box>
-            ) : null}
-            {row.matchedPid !== null ? (
-              <Box direction="row" gap="xs" align="center" shrink={false}>
-                <Text muted size="xs">
-                  ·
-                </Text>
-                <Text muted size="xs">{`pid ${row.matchedPid}`}</Text>
-              </Box>
-            ) : null}
-          </Row>
-          {row.processNote ? (
-            <Text
-              size="xs"
-              muted={row.process !== 'unknown'}
-              tone={row.process === 'unknown' ? 'warning' : undefined}
-            >
-              {row.process === 'unknown' ? `无法判定：${row.processNote}` : row.processNote}
+            <Text muted size="xs">
+              ·
             </Text>
-          ) : null}
+            <Text muted size="xs" truncate>
+              {identity}
+            </Text>
+          </Row>
         </Box>
         {!confirmingThis ? (
           <Box shrink={false}>
             {!closeable ? (
-              <Button
-                size="xs"
-                variant="ghost"
-                disabled
-                tooltip={
-                  row.state !== 'done'
-                    ? `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」`
-                    : row.process === 'unknown'
-                      ? (row.processNote ?? '没有进程命中这个会话的候选 id，无法判定它是否还在跑；先刷新确认')
-                      : row.process === 'stopped'
-                        ? '这个会话没有任何可用 id，也没有进程在跑（未运行）'
-                        : '这个会话没有终端也没有 sessionId，没法定位进程'
-                }
-              >
+              <Button size="xs" variant="ghost" disabled tooltip={disabledTooltip}>
                 {unavailable ?? (row.state === 'done' ? '无法关闭' : '关闭')}
               </Button>
             ) : (
@@ -288,6 +283,7 @@ function renderRow(row: SessionRow): OrcaNode {
                 size="xs"
                 variant="outline"
                 tone="neutral"
+                tooltip={closeTooltip}
                 disabled={otherBusy}
                 onPress={() => {
                   set(actionError, null)
