@@ -1,13 +1,15 @@
 # 会话资源（chat-reclaim）
 
-Orca 的「资源管理器」能看清每个 bot/工作区占了多少内存，却没有关闭会话的按钮；关掉页签也不会结束会话进程。这个本地插件在右侧栏集中列出所有工作区的 agent 会话，并真正把它们关掉：带终端的走终端 API，chat 会话向它的 claude 进程组发 SIGTERM。官方补上这个能力后可以直接停用。
+Orca 的「资源管理器」能看清每个 bot/工作区占了多少内存，却没有关闭会话的按钮；关掉页签也不会结束会话进程。这个本地插件在右侧栏集中列出所有工作区的 agent 会话，并真正把它们关掉：带终端的走终端 API，chat 会话定位到它的进程组后发 SIGTERM——按会话 id 精确匹配，对命令行不提供会话 id 的 agent 按种类一对一配对。官方补上这个能力后可以直接停用。
 
 ## 面板做什么
 
 - 按工作区（目录）分组，当前工作区排最前，其后是有匹配到进程的会话的工作区，其余排在最后；**组默认折叠**，点组标题展开/收起，组标题右侧分别列出 `在运行 2 · 无法判定 1 · 未运行 3` 里非零的项（类型与总会话数见组标题悬浮提示）。
 - 列表默认**只显示匹配到进程的会话**（没有运行会话的工作区组也一并隐藏）。顶部一行对账：`Orca 会话 N 条 · 匹配到进程 M 条`；M<N 时下一行说明其余行里多少条无法判定、多少条确认未运行。右侧「显示无进程 (n)」开关打开后才出现这些组与行。开关状态和每个工作区的展开状态都存在 `orca.storage`，刷新、重开面板、插件重载后沿用。
 - 每行第一行是会话标题（过长截到 40 字加省略号），第二行是 `会话 <id 前 8 位> · <agent> · 已空闲 <时长>`，再加状态徽章；这里的 `<id 前 8 位>` 就是查标题用的同一个 id。
-- 运行状态**只看进程**：会话的候选 id（`agents.list` 的 `sessionId`，以及 `agent_session_records.providerHandleChain` 里出现过的每个会话 id）逐个去 `ps` 找 `--session-id=<id>` 或 `--resume=<id>` 的 claude 进程。命中 → 运行中/空闲（按 Orca 报的 state）；有候选 id 但一个都没命中，或 `ps` 读不到 → **无法判定**；只有会话确实没有任何候选 id，才标 **未运行**。会话并没有因为进程退出而结束，下次发消息会重新拉起。
+- 运行状态**只看进程**。先按 id 精确匹配：会话的候选 id（`agents.list` 的 `sessionId`，以及 `agent_session_records.providerHandleChain` 里出现过的每个会话 id）逐个去 `ps` 找命令行带 `--session-id=<id>` 或 `--resume=<id>` 的 agent 进程，agent 种类不限。命中 → 运行中/空闲（按 Orca 报的 state）。
+- 没有 id 的 agent（如 antigravity，进程命令行里根本没有 `--session-id=`/`--resume=`，cwd 又和别的会话共用）按**种类一对一配对**：该种类的会话数与它的进程数**完全相等**时才配对，徽章显示 `运行中（无会话 id）`，行里给出配到的 pid；数量不等就全部标 `无法判定`，不猜。
+- **无法判定**会写清原因，不是笼统四个字：`ps` 读不到（附系统错误）、会话 id 没命中任何进程、还是这种 agent 不提供会话 id 且数量不等。只有会话确实没有任何候选 id、也没有配对可用，才标 **未运行**。会话并没有因为进程退出而结束，下次发消息会重新拉起。
 - 每行一个「关闭」按钮，两步确认：点「关闭」后变成「确认关闭」，再点才真的关。**只有 `done` 且匹配到进程（或带终端）的会话能点**；运行中 / 待确认 / 等待中、无法判定、未运行都置灰并说明原因。
 - 每次点击的结果都落在那一行里：成功显示「已关闭」，失败显示「关闭失败：<原因>」，同时顶部还有一条带错误码的提示，最近的记录进「最近操作」。
 - 顶部「刷新」重新读取全部工作区；「回收空闲 (n)」一次关闭**当前工作区**里状态为 `done`、且带终端或匹配到进程的会话，先列出将关闭哪几条，确认后才逐条执行。正在跑的（`working`）永远不会被回收，实际关闭对象以确认框列出的标题为准。
@@ -41,13 +43,16 @@ Orca 重启后，没在跑的 chat 会话 `agents.list` 会返回 `sessionId: nu
 
 **chat 会话**（`terminalId` 为空）走进程兜底，只用系统自带命令，不引入依赖：
 
-1. **候选 id → 进程**：`ps -Ao pid,ppid,pgid,command`，找 argv[0] 以 `/.local/bin/claude` 结尾、参数含 `--session-id=<id>` **或** `--resume=<id>` 的那条。候选 id 是 `agents.list` 的 `sessionId`，加上 `~/Library/Application Support/orca/agent-session-domain.db` 里该会话 `providerHandleChain` 出现过的每个会话 id（用 `sqlite3 -readonly` 一次读出）。新建会话用前者、恢复的会话用后者，rewind 后的新 id 也在这条链里。
-2. **每个候选 id 都过一遍**，命中一个就够；两个候选 id 各命中一个不同进程（多 pane 复用了同一会话）直接拒绝，不猜。
-3. **安全闸门**，任一不满足就不动手并返回原因：
+1. **先认进程清单**：`ps -Ao pid,ppid,pgid,command` 里 `orca-provider-exec … -- <可执行文件> …` 的子进程就是 Orca 为 chat 会话拉起的 agent 进程，按 `--` 后面的可执行文件归类：`claude` → claude、`agy` → antigravity、`pi` → pi、`codex` → codex，其余按可执行文件名。CLI 自己再拉起的第二个 provider-exec 是 stdin-end 上报进程，不算 agent。
+2. **候选 id → 进程**：参数含 `--session-id=<id>` **或** `--resume=<id>` 的 agent 进程。候选 id 是 `agents.list` 的 `sessionId`，加上 `~/Library/Application Support/orca/agent-session-domain.db` 里该会话 `providerHandleChain` 出现过的每个会话 id（用 `sqlite3 -readonly` 一次读出）。新建会话用前者、恢复的会话用后者，rewind 后的新 id 也在这条链里。
+3. **每个候选 id 都过一遍**，命中一个就够；两个候选 id 各命中一个不同进程（多 pane 复用了同一会话）直接拒绝，不猜。
+4. **没有 id 的 agent 按种类配对**：对某一种类，把 `agents.list` 里所有 chat 会话（跨工作区，进程是全机的）与该种类不带 id 的进程分组；数量完全相等才按稳定顺序一对一配上并显示 pid，否则整组标 `无法判定` 并写出两边的数量。有工作区读取失败时不做配对（会话总数不可信）。
+5. **安全闸门**，任一不满足就不动手并返回原因：
    - 父进程必须是 `orca-provider-exec`；
-   - `pgid == pid`（该 claude 自成进程组）；
-   - 不能和插件 worker 同属一个进程组。
-4. **关闭**：`process.kill(-pid, 'SIGTERM')`，杀掉整个进程组（claude 的 MCP 子进程同组）；最多轮询 5 秒确认进程消失。**不升级 SIGKILL**，5 秒后还在就报失败。
+   - `pgid == pid`（该 agent 自成进程组）；
+   - 不能和插件 worker 同属一个进程组；
+   - 按种类配对的关闭会再读一次快照，确认配对没变，且 pid 跑的种类与会话一致。
+6. **关闭**：`process.kill(-pid, 'SIGTERM')`，杀掉整个进程组（agent 的 MCP 子进程同组）；最多轮询 5 秒确认进程消失。**不升级 SIGKILL**，5 秒后还在就报失败。
 
 杀之前把目标 pid / pgid / uuid / 标题写进 `orca.storage` 的 `recentOps`（最多 50 条），写入失败只记日志，不会把一个已经完成的关闭变成错误。
 
@@ -116,7 +121,7 @@ orca plugin dev request . sessions.close --data '{"workspaceId":"<id>","sessionI
 - `src/worker.ts` 扫描会话、判断可否关闭、选择关闭路径、写操作记录
 - `src/sessions.ts` 纯函数：`selectDone`（空闲统计）、`selectIdle`（可关闭的回收筛选）、`groupSessions`（分组，当前工作区最前）
 - `src/sessionProcess.ts` 进程关闭的编排（注入 `SignalOps`，测试用假实现）
-- `src/processTable.ts` 解析 `ps`、候选 id 匹配与目标判定
+- `src/processTable.ts` 解析 `ps`、按 agent 种类归类进程、候选 id 匹配与目标判定
 - `src/sessionRecord.ts` 从 `providerHandleChain` 取候选 id、给标题做 id 别名
 - `src/botChats.ts` 遍历 bot 的 `orca bot chats` 拼标题表（按 Orca 会话 id）
 - `src/hostOps.ts` 真实机器侧：`sqlite3`、`ps`、`process.kill`、`orca` CLI
@@ -127,9 +132,10 @@ orca plugin dev request . sessions.close --data '{"workspaceId":"<id>","sessionI
 ## 已知限制
 
 - 只对 macOS 成立：会话数据库路径和 `ps` 的输出格式按 macOS 写。
-- 有候选 id 但 `ps` 没命中一律标「无法判定」，不会断言它未运行；真实状态以刷新那一刻的进程表为准，刷新后仍可能变化。
+- 有候选 id 但 `ps` 没命中一律标「无法判定」并写出原因，不会断言它未运行；真实状态以刷新那一刻的进程表为准，刷新后仍可能变化。
+- 不提供会话 id 的 agent 只能靠「会话数 = 进程数」配对：数量相等时也无法确定哪个 pid 对应哪条会话；数量不等时整组标无法判定，不猜。点关闭时会重新读一次快照，配对变了就拒绝。
 - Orca 重启后，没在跑的 chat 会话会丢掉 provider id（`sessionId: null`），标题和关闭都无从下手，直到它在 Orca 里重新跑起来。
-- 进程链是 Orca 的内部实现（`.local/bin/claude` + `orca-provider-exec`），启动参数是 `--session-id=` 还是 `--resume=` 也随版本变；两种都认，仍对不上就在面板上显示原因，不会乱杀进程。
+- 进程链是 Orca 的内部实现（`orca-provider-exec` + agent 可执行文件），启动参数是 `--session-id=` 还是 `--resume=` 也随版本变；两种都认，没有 id 的按种类配对，仍对不上就在面板上显示原因，不会乱杀进程。
 - 「匹配到进程」按读取那一刻的 `ps` 判断；点刷新会重新判断，真去关闭时 worker 还会再判一次（不在就直接返回原因）。
 - 标题来自 `orca bot chats`：某个 bot 调用失败时，它名下的会话这一轮只有 id 前缀；刚建的会话要等 CLI 认识它之后才有标题。
 - SIGTERM 后 5 秒仍在就报失败，不自动升级 SIGKILL。

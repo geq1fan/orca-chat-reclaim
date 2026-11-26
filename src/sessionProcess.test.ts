@@ -1,6 +1,6 @@
 import { assert, test } from 'orca/testing'
 import type { SessionRecord } from './sessionRecord'
-import { stopSessionWithSignal, TERM_WAIT_MS, type SignalOps } from './sessionProcess'
+import { stopPairedSession, stopSessionWithSignal, TERM_WAIT_MS, type SignalOps } from './sessionProcess'
 
 const CLAUDE = '/Users/me/.local/bin/claude'
 const PROVIDER = '/Applications/Orca.app/Contents/MacOS/orca-provider-exec'
@@ -221,6 +221,24 @@ test('falls back to the stored handle chain when the row id is Orca’s own', as
   assert.equal(outcome.ok, true)
   assert.equal(outcome.sessionUuid, SESSION_ID)
   assert.deepEqual(signalled, [900])
+})
+
+test('refuses a paired pid that runs another agent kind', async () => {
+  // A count-based pairing must never reach a process of a different agent: pid 900 is claude.
+  const { ops, signalled } = fakeOps({ table: processTable(SESSION_ID) })
+
+  const outcome = await stopPairedSession({
+    workspaceId: 'w1',
+    sessionId: 'orcasession-0000-1111',
+    agent: 'antigravity',
+    pid: 900,
+    dryRun: false,
+    ops
+  })
+
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'kind_mismatch')
+  assert.deepEqual(signalled, [])
 })
 
 test('an unreadable session database is named in the refusal', async () => {

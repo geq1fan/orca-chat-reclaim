@@ -64,6 +64,8 @@ type DisplayState = { label: string; tone: Tone }
 function displayState(row: SessionRow): DisplayState {
   if (row.process === 'stopped') return { label: '未运行', tone: 'neutral' }
   if (row.process === 'unknown') return { label: '无法判定', tone: 'warning' }
+  // An agent whose CLI takes no session id is matched by kind, not by id: say so in the badge.
+  if (row.pairing === 'agent') return { label: '运行中（无会话 id）', tone: 'accent' }
   if (row.state === 'working') return { label: '运行中', tone: 'accent' }
   if (row.state === 'blocked') return { label: '待确认', tone: 'warning' }
   if (row.state === 'waiting') return { label: '等待中', tone: 'neutral' }
@@ -126,7 +128,12 @@ async function closeSession(row: SessionRow): Promise<void> {
   try {
     const outcome = await plugin.request(
       'sessions.close',
-      { workspaceId: row.workspaceId, sessionId: row.sessionId, terminalId: row.terminalId },
+      {
+        workspaceId: row.workspaceId,
+        sessionId: row.sessionId,
+        terminalId: row.terminalId,
+        pid: row.pairing === 'agent' ? row.matchedPid : null
+      },
       { timeoutMs: 30000 }
     )
     if (outcome.ok) {
@@ -238,7 +245,24 @@ function renderRow(row: SessionRow): OrcaNode {
                 <Text muted size="xs">{`会话 ${shortId}`}</Text>
               </Box>
             ) : null}
+            {row.matchedPid !== null ? (
+              <Box direction="row" gap="xs" align="center" shrink={false}>
+                <Text muted size="xs">
+                  ·
+                </Text>
+                <Text muted size="xs">{`pid ${row.matchedPid}`}</Text>
+              </Box>
+            ) : null}
           </Row>
+          {row.processNote ? (
+            <Text
+              size="xs"
+              muted={row.process !== 'unknown'}
+              tone={row.process === 'unknown' ? 'warning' : undefined}
+            >
+              {row.process === 'unknown' ? `无法判定：${row.processNote}` : row.processNote}
+            </Text>
+          ) : null}
         </Box>
         {!confirmingThis ? (
           <Box shrink={false}>
@@ -251,7 +275,7 @@ function renderRow(row: SessionRow): OrcaNode {
                   row.state !== 'done'
                     ? `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」`
                     : row.process === 'unknown'
-                      ? '没有进程命中这个会话的候选 id，无法判定它是否还在跑；先刷新确认'
+                      ? (row.processNote ?? '没有进程命中这个会话的候选 id，无法判定它是否还在跑；先刷新确认')
                       : row.process === 'stopped'
                         ? '这个会话没有任何可用 id，也没有进程在跑（未运行）'
                         : '这个会话没有终端也没有 sessionId，没法定位进程'
@@ -298,7 +322,7 @@ function renderRow(row: SessionRow): OrcaNode {
               variant="solid"
               tone="danger"
               disabled={busyThis}
-              tooltip="向这个会话的 claude 进程组发 SIGTERM；若它带终端，则关闭终端"
+              tooltip="向这个会话的 agent 进程组发 SIGTERM；若它带终端，则关闭终端"
               onPress={() => void closeSession(row)}
             >
               {busyThis ? '关闭中…' : '确认关闭'}
@@ -520,12 +544,12 @@ export default function Panel(): OrcaNode {
             <Text size="sm">
               {idle.length === 0 || currentWorkspaceId === null
                 ? idleAll.length > 0
-                  ? `当前工作区有 ${idleAll.length} 个 done 会话，但它们都没有可关闭的进程（没有终端，也没有命中 claude 进程）。`
+                  ? `当前工作区有 ${idleAll.length} 个 done 会话，但它们都没有可关闭的进程（没有终端，也没有命中进程）。`
                   : '当前工作区没有状态为 done 的会话，无需回收。'
                 : `将关闭当前工作区「${currentWorkspace?.name ?? currentWorkspaceId}」里 ${idle.length} 个会话：${idle
                     .slice(0, 3)
                     .map((session) => `「${truncateTitle(session.title, 20)}」`)
-                    .join('')}${idle.length > 3 ? ` 等 ${idle.length} 个` : ''}。带终端的走 terminal.close，chat 会话向它的 claude 进程组发 SIGTERM，进程会随之结束，无法撤销。`}
+                    .join('')}${idle.length > 3 ? ` 等 ${idle.length} 个` : ''}。带终端的走 terminal.close，chat 会话按会话 id（或没有 id 的 agent 的种类配对）定位进程组后发 SIGTERM，进程会随之结束，无法撤销。`}
             </Text>
             {isStale ? (
               <Text muted size="xs">

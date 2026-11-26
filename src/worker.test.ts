@@ -68,6 +68,25 @@ function processTable(
   return `  PID  PPID  PGID COMMAND\n800 700 800 ${PROVIDER} --cli-input-fd7 1000 3000 -- ${CLAUDE}\n${rows.join('')}`
 }
 
+const AGY = '/Users/me/.local/bin/agy'
+
+/**
+ * The live host's shape for any agent: a wrapper starts the CLI, and the CLI starts a second
+ * wrapper for itself (the stdin-end reporter), which must never count as an agent process.
+ */
+function agentChain(pid: number, binary: string, args: string): string {
+  const wrapper = `${PROVIDER} --cli-input-fd7 1000 3000 session stdin-end -- ${binary} ${args}`
+  return (
+    `${pid} 700 ${pid} ${wrapper}\n` +
+    `${pid + 2} ${pid} ${pid + 2} ${binary} ${args}\n` +
+    `${pid + 3} ${pid + 2} ${pid + 3} ${wrapper}\n`
+  )
+}
+
+function agentProcessTable(entries: { pid: number; binary: string; args: string }[]): string {
+  return `  PID  PPID  PGID COMMAND\n${entries.map((entry) => agentChain(entry.pid, entry.binary, entry.args)).join('')}`
+}
+
 /** Installs fake process side effects; returns the pgids they were signalled with. */
 function fakeOps(table: string, psError?: string, records: SessionRecord[] = []): number[] {
   const signalled: number[] = []
@@ -502,6 +521,100 @@ test('maps four live sessions one to one, even when Orca reports an older id', a
   // No title crossed onto a process it does not belong to.
   assert.equal(rows.filter((row) => row.title === 'Home').length, 1)
   assert.equal(rows.filter((row) => row.title === '分析当前 Mac 内存占用').length, 1)
+  await worker.deactivate()
+})
+
+const ANTI = 'b9388fd5-6cae-42ad-9627-0aad35007921'
+const ANTI_ARGS = 'acp --dangerously-skip-permissions'
+
+test('an agent that carries no session id is paired one to one with its only process', async () => {
+  // antigravity: the argv has no --resume=/--session-id=, and its cwd is shared with every other
+  // chat, so neither id nor directory can tell it apart. One session and one process is the
+  // only evidence there is.
+  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
+  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]))
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  assert.equal(snapshot.sessions[0]?.process, 'running')
+  assert.equal(snapshot.sessions[0]?.pairing, 'agent')
+  assert.equal(snapshot.sessions[0]?.matchedId, null)
+  assert.equal(snapshot.sessions[0]?.matchedPid, 8993)
+  assert.equal(snapshot.sessions[0]?.matchedPgid, 8993)
+  assert.match(snapshot.sessions[0]?.processNote ?? '', /1:1/)
+  await worker.deactivate()
+})
+
+test('two sessions and one id-less process are 无法判定, never paired', async () => {
+  const host = hostWith([
+    chat(ANTI, { agent: 'antigravity' }),
+    chat('7980aac2-0000-4000-8000-000000000000', { agent: 'antigravity' })
+  ])
+  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]))
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  assert.deepEqual(
+    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedPid]),
+    [
+      ['unknown', null, null],
+      ['unknown', null, null]
+    ]
+  )
+  assert.match(snapshot.sessions[0]?.processNote ?? '', /会话 2 个 \/ 进程 1 个/)
+  assert.match(snapshot.sessions[0]?.processNote ?? '', /不猜/)
+  await worker.deactivate()
+})
+
+test('an agent whose CLI carries an id still matches exactly next to an id-less one', async () => {
+  const host = hostWith([chat(S1), chat(ANTI, { agent: 'antigravity' })])
+  fakeOps(
+    agentProcessTable([
+      { pid: 800, binary: CLAUDE, args: `--resume=${S1}` },
+      { pid: 8991, binary: AGY, args: ANTI_ARGS }
+    ])
+  )
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  assert.deepEqual(
+    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedId, session.matchedPid]),
+    [
+      ['running', 'id', S1, null],
+      ['running', 'agent', null, 8993]
+    ]
+  )
+  await worker.deactivate()
+})
+
+test('closes a paired id-less session by the pid its kind was paired to', async () => {
+  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
+  const signalled = fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]))
+  const worker = await mountWorker(main, { host })
+
+  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: ANTI, pid: 8993 })
+
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.how, 'signal')
+  assert.equal(outcome.pid, 8993)
+  assert.equal(outcome.pgid, 8993)
+  assert.deepEqual(signalled, [8993])
+  await worker.deactivate()
+})
+
+test('a paired close refuses a pid the fresh pairing no longer names', async () => {
+  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
+  const signalled = fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]))
+  const worker = await mountWorker(main, { host })
+
+  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: ANTI, pid: 9000 })
+
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'pairing_changed')
+  assert.deepEqual(signalled, [])
   await worker.deactivate()
 })
 

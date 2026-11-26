@@ -15,6 +15,10 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     sessionId: 'session-1',
     process: null,
     matchedId: null,
+    pairing: null,
+    matchedPid: null,
+    matchedPgid: null,
+    processNote: null,
     ...overrides
   }
 }

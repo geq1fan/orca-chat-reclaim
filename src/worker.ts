@@ -6,10 +6,25 @@ import { buildTitleMap, type ChatTitleOps } from './botChats'
 import { messageOf } from './errors'
 import { createChatTitleOps, createSignalOps } from './hostOps'
 import { AGENT_STATE_LABEL } from './labels'
-import type { CloseOutcome, OpRecord, ProcessState, ReclaimResult, SessionRow, SessionSnapshot } from './protocol'
-import { findRunningProcessId, parseProcessTable, type PsRow } from './processTable'
+import type {
+  AgentState,
+  CloseOutcome,
+  OpRecord,
+  ProcessState,
+  ReclaimResult,
+  SessionRow,
+  SessionSnapshot,
+  WorkspaceRow
+} from './protocol'
+import {
+  agentProcesses,
+  findRunningProcessId,
+  parseProcessTable,
+  providesSessionId,
+  type PsRow
+} from './processTable'
 import { aliasTitles, sessionCandidates, type SessionRecord } from './sessionRecord'
-import { stopSessionWithSignal, type SignalOps } from './sessionProcess'
+import { stopPairedSession, stopSessionWithSignal, type SignalOps } from './sessionProcess'
 import { selectIdle } from './sessions'
 
 /** How many `agents.list` calls are in flight at once. 127 workspaces one by one is slow. */
@@ -127,6 +142,25 @@ async function recordOp(orca: OrcaWorkerApi, entry: OpRecord): Promise<void> {
   }
 }
 
+/** The `agents.list` fields this plugin reads; host-only fields are ignored. */
+type ListedAgent = {
+  terminalId: string | null
+  title?: string | null
+  task?: { title: string } | null
+  sessionId?: string | null
+  agent?: string | null
+  state: AgentState
+  stateStartedAt: number
+}
+
+/** A chat session matched to a process without ever seeing its id. */
+type KindPairing = {
+  pid: number
+  pgid: number
+  /** The kind's session count, which equals its process count — the basis of the pairing. */
+  count: number
+}
+
 /** Reads every workspace and the agent sessions inside them. */
 async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promise<SessionSnapshot> {
   const listed = await orca.host.call('workspace.list', { includeStatus: true })
@@ -143,10 +177,12 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
     records = []
   }
   let processTable: PsRow[] | null = null
+  let psError: string | null = null
   try {
     processTable = parseProcessTable(await signalOperations().listProcesses())
-  } catch {
+  } catch (error) {
     processTable = null
+    psError = messageOf(error)
   }
 
   const titles = aliasTitles(await loadTitles(orca, refreshTitles), records)
@@ -158,7 +194,7 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
     terminalCount: workspace.status?.terminalCount ?? null
   }))
 
-  const sessions: SessionRow[] = []
+  const scanned: { workspace: WorkspaceRow; agent: ListedAgent }[] = []
   let failedWorkspaces = 0
 
   for (let start = 0; start < listed.workspaces.length; start += BATCH) {
@@ -181,52 +217,136 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
         continue
       }
       for (const agent of agents) {
-        const rowId = agent.sessionId ?? null
-        const candidates = sessionCandidates(records, rowId)
-        const matchedId =
-          agent.terminalId !== null || processTable === null
-            ? null
-            : findRunningProcessId(processTable, candidates)
-
-        let process: ProcessState | null
-        if (agent.terminalId !== null) {
-          process = null
-        } else if (candidates.length === 0) {
-          // No id a claude process could carry: there is nothing here to run.
-          process = 'stopped'
-        } else if (matchedId) {
-          process = 'running'
-        } else {
-          // Ids exist but none matched (`ps` unreadable, or the process is gone): unjudged,
-          // never reported as "not running".
-          process = 'unknown'
-        }
-
-        // The row shows the id its process answered to, and looks the title up by that same id.
-        const displayId = agent.terminalId !== null ? rowId ?? agent.terminalId : matchedId ?? rowId
-        const title =
-          agent.terminalId !== null
-            ? terminalLabel(agent)
-            : displayId
-              ? (titles[displayId] ?? idLabel(displayId))
-              : '未命名会话'
-
-        sessions.push({
-          workspaceId: workspace.id,
-          workspaceName: workspace.name,
-          workspaceKind: workspace.kind,
-          terminalId: agent.terminalId,
-          title,
-          agent: agent.agent ?? 'unknown',
-          state: agent.state,
-          stateStartedAt: agent.stateStartedAt,
-          sessionId: rowId,
-          process,
-          matchedId
+        scanned.push({
+          workspace: {
+            id: workspace.id,
+            name: workspace.name,
+            kind: workspace.kind,
+            terminalCount: workspace.status?.terminalCount ?? null
+          },
+          agent
         })
       }
     }
   }
+
+  const processes = processTable ? agentProcesses(processTable) : []
+
+  // Exact matches first: an agent whose CLI carries a conversation id is reached by that id.
+  const candidatesAt = new Map<number, string[]>()
+  const matchedAt = new Map<number, string>()
+  scanned.forEach((entry, index) => {
+    if (entry.agent.terminalId !== null || processTable === null) return
+    const candidates = sessionCandidates(records, entry.agent.sessionId ?? null)
+    candidatesAt.set(index, candidates)
+    const matchedId = findRunningProcessId(processTable, candidates)
+    if (matchedId) matchedAt.set(index, matchedId)
+  })
+
+  // Ids that matched nothing may belong to an agent kind that never puts an id on its command
+  // line. Only an exact 1:1 count is evidence of a pairing; any other count is left unjudged.
+  const pendingByKind = new Map<string, number[]>()
+  scanned.forEach((entry, index) => {
+    if (entry.agent.terminalId !== null || processTable === null || matchedAt.has(index)) return
+    const kind = entry.agent.agent ?? 'unknown'
+    if (providesSessionId(kind, processes)) return
+    const members = pendingByKind.get(kind)
+    if (members) members.push(index)
+    else pendingByKind.set(kind, [index])
+  })
+
+  const pairs = new Map<number, KindPairing>()
+  const pairingNotes = new Map<string, string>()
+  for (const [kind, indexes] of pendingByKind) {
+    if (failedWorkspaces > 0) {
+      pairingNotes.set(
+        kind,
+        `有 ${failedWorkspaces} 个工作区没读到，无法确认本机 ${kind} 的会话总数，不配对`
+      )
+      continue
+    }
+    const kindProcesses = processes
+      .filter((process) => process.kind === kind && process.providerId === null)
+      .sort((left, right) => left.row.pid - right.row.pid)
+    if (kindProcesses.length !== indexes.length) {
+      pairingNotes.set(
+        kind,
+        `${kind} 的命令行不带会话 id；本机这种会话 ${indexes.length} 个 / 进程 ${kindProcesses.length} 个，数量不等，不猜`
+      )
+      continue
+    }
+    // Deterministic order, so the same machine state always yields the same pairings.
+    const ordered = [...indexes].sort((left, right) => {
+      const leftSession = scanned[left]
+      const rightSession = scanned[right]
+      const byStart = leftSession.agent.stateStartedAt - rightSession.agent.stateStartedAt
+      if (byStart !== 0) return byStart
+      return (leftSession.agent.sessionId ?? '').localeCompare(rightSession.agent.sessionId ?? '')
+    })
+    for (let position = 0; position < ordered.length; position += 1) {
+      const index = ordered[position]
+      const process = kindProcesses[position]
+      if (index === undefined || !process) continue
+      pairs.set(index, { pid: process.row.pid, pgid: process.row.pgid, count: ordered.length })
+    }
+  }
+
+  const sessions: SessionRow[] = scanned.map(({ workspace, agent }, index) => {
+    const rowId = agent.sessionId ?? null
+    const candidates = candidatesAt.get(index) ?? []
+    const matchedId = matchedAt.get(index) ?? null
+    const pair = pairs.get(index) ?? null
+    const kind = agent.agent ?? 'unknown'
+
+    let process: ProcessState | null
+    let processNote: string | null = null
+    if (agent.terminalId !== null) {
+      process = null
+    } else if (processTable === null) {
+      process = 'unknown'
+      processNote = `ps 读不到：${psError ?? '未知错误'}`
+    } else if (matchedId) {
+      process = 'running'
+    } else if (pair) {
+      process = 'running'
+      processNote = `${kind} 不提供会话 id；本机这种会话 ${pair.count} 个、进程 ${pair.count} 个，1:1 配到 pid ${pair.pid}（pgid ${pair.pgid}）`
+    } else if (candidates.length === 0) {
+      // No id any process could carry, and no pairing to stand on: nothing here to run.
+      process = 'stopped'
+    } else {
+      // Ids exist but none matched, or the id-less pairing refused: unjudged, never "not running".
+      process = 'unknown'
+      processNote =
+        pairingNotes.get(kind) ?? '会话 id 没有命中任何进程（进程可能已退出，或 ps 里看不到）'
+    }
+
+    // The row shows the id its process answered to, and looks the title up by that same id.
+    const displayId = agent.terminalId !== null ? rowId ?? agent.terminalId : matchedId ?? rowId
+    const title =
+      agent.terminalId !== null
+        ? terminalLabel(agent)
+        : displayId
+          ? (titles[displayId] ?? idLabel(displayId))
+          : '未命名会话'
+
+    return {
+      workspaceId: workspace.id,
+      workspaceName: workspace.name,
+      workspaceKind: workspace.kind,
+      terminalId: agent.terminalId,
+      title,
+      agent: kind,
+      state: agent.state,
+      stateStartedAt: agent.stateStartedAt,
+      sessionId: rowId,
+      process,
+      matchedId,
+      pairing: matchedId ? ('id' as const) : pair ? ('agent' as const) : null,
+      matchedPid: pair?.pid ?? null,
+      matchedPgid: pair?.pgid ?? null,
+      processNote
+    }
+  })
 
   let recentOps: OpRecord[] = []
   try {
@@ -275,6 +395,8 @@ type CloseInput = {
   workspaceId: string
   sessionId?: string | null
   terminalId?: string | null
+  /** The pid an id-less agent's row was paired to; absent for id matches. */
+  pid?: number | null
   dryRun?: boolean
 }
 
@@ -370,6 +492,51 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
     return finish({ ...base, code: 'no_handle', message: '这个会话既没有终端也没有 sessionId，没法关' }, title)
   }
 
+  const pid = typeof input.pid === 'number' ? input.pid : null
+  if (pid !== null) {
+    // The panel offers a pid only for an agent that carries no session id. Re-read the same
+    // pairing it drew before signalling: a changed count or a different pid is refused, because
+    // an id-less pairing is a count-based inference and may not outlive the snapshot that made it.
+    const snapshot = await readSnapshot(orca, false)
+    const row = snapshot.sessions.find(
+      (session) =>
+        session.workspaceId === input.workspaceId &&
+        session.terminalId === null &&
+        session.sessionId === sessionId
+    )
+    if (!row || row.pairing !== 'agent' || row.matchedPid !== pid) {
+      return finish(
+        {
+          ...base,
+          sessionId,
+          code: 'pairing_changed',
+          message: '这个会话和进程的配对已经变了（数量不再一一对应），刷新确认后再关，不盲杀'
+        },
+        title
+      )
+    }
+    if (row.state !== 'done') {
+      return finish(
+        {
+          ...base,
+          sessionId,
+          code: 'not_idle',
+          message: `会话现在是「${AGENT_STATE_LABEL[row.state]}」，只有 done 才能关闭`
+        },
+        title
+      )
+    }
+    const outcome = await stopPairedSession({
+      workspaceId: input.workspaceId,
+      sessionId,
+      agent: row.agent,
+      pid,
+      dryRun,
+      ops: signalOperations()
+    })
+    return finish(outcome, title)
+  }
+
   const outcome = await stopSessionWithSignal({
     workspaceId: input.workspaceId,
     sessionId,
@@ -391,6 +558,7 @@ async function reclaimIdle(orca: OrcaWorkerApi, workspaceId: string, dryRun: boo
       workspaceId,
       sessionId: session.sessionId,
       terminalId: session.terminalId,
+      pid: session.pairing === 'agent' ? session.matchedPid : null,
       dryRun
     })
     outcomes.push(outcome)
