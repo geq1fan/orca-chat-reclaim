@@ -24,7 +24,7 @@ Orca 的「资源管理器」能看清每个 bot/工作区占了多少内存，�
 
 1. `orca bot list --json` 拿到本机所有 bot（面板会显示别的 bot 的会话，必须全查）；
 2. 对每个 bot 跑 `orca bot chats --json --bot <名字>`，收集 `id → title`；单个 bot 失败就跳过，不影响其它 bot。这里的 id 是 Orca 的会话 id；
-3. 读 `agent_session_records` 的 `session_id` 与 `providerHandleChain`，把一条会话的标题同时挂到它链上的每个会话 id（一次 rewind 会换掉 claude 的会话 id，旧 id 仍留在链里）。
+3. 读 `agent_session_records` 的 `session_id`、生成列 `adopted_native_id` 与 `providerHandleChain`，把一条会话的标题在 Orca 会话 id 和它采用的原生会话 id 之间双向登记；链上的每个 id 再补一遍（claude 的句柄带 `sessionId`，antigravity、pi 的带 `nativeId`；一次 rewind 会换掉 id，旧 id 仍留在链里）。antigravity 没有 claude 式句柄链，靠 `adopted_native_id` 也能查到标题。
 
 标题表按 Orca 会话 id 建。每行显示哪个 id（匹配到进程的那个候选 id；没命中时用 `agents.list` 给的 id），就用这个 id 查标题；查不到退回 `会话 <id 前 8 位>`，不会拿 agent 名冒充当标题。进程、id、标题三者用同一条链，不会把一条会话的标题贴到另一条的进程上。
 
@@ -122,7 +122,7 @@ orca plugin dev request . sessions.close --data '{"workspaceId":"<id>","sessionI
 - `src/sessions.ts` 纯函数：`selectDone`（空闲统计）、`selectIdle`（可关闭的回收筛选）、`groupSessions`（分组，当前工作区最前）
 - `src/sessionProcess.ts` 进程关闭的编排（注入 `SignalOps`，测试用假实现）
 - `src/processTable.ts` 解析 `ps`、按 agent 种类归类进程、候选 id 匹配与目标判定
-- `src/sessionRecord.ts` 从 `providerHandleChain` 取候选 id、给标题做 id 别名
+- `src/sessionRecord.ts` 从原生 id 与 `providerHandleChain` 取候选 id、给标题做 id 别名
 - `src/botChats.ts` 遍历 bot 的 `orca bot chats` 拼标题表（按 Orca 会话 id）
 - `src/hostOps.ts` 真实机器侧：`sqlite3`、`ps`、`process.kill`、`orca` CLI
 - `src/node.d.ts` worker 用到的三个 Node 模块的最小类型声明（插件无依赖）

@@ -64,21 +64,33 @@ export function createChatTitleOps(): ChatTitleOps {
 export function createSignalOps(): SignalOps {
   return {
     async listSessionRecords() {
-      // One read for the whole snapshot: every stored session's Orca id and the conversation
-      // ids in its handle chain. Only the chain is selected; a record can be over a megabyte.
+      // One read for the whole snapshot: every stored session's Orca id, the native id it
+      // adopted, and the ids in its handle chain. Only these columns are selected; a record can
+      // be over a megabyte. `adopted_native_id` is a generated column, so the record JSON is never
+      // parsed here.
       const output = await run('sqlite3', [
         '-readonly',
         '-json',
         `file:${DB_PATH}?mode=ro`,
-        "select session_id, json_extract(record_json,'$.providerHandleChain') as chain from agent_session_records;"
+        'select session_id, adopted_native_id, ' +
+          "json_extract(record_json,'$.providerHandleChain') as chain from agent_session_records;"
       ])
-      const rows = parseJson<{ session_id?: unknown; chain?: unknown }[]>(output)
+      const rows = parseJson<{ session_id?: unknown; adopted_native_id?: unknown; chain?: unknown }[]>(
+        output
+      )
       if (!Array.isArray(rows)) return []
       const records: SessionRecord[] = []
       for (const row of rows) {
         if (typeof row.session_id !== 'string' || row.session_id.length === 0) continue
         const chain = typeof row.chain === 'string' ? row.chain : null
-        records.push({ sessionId: row.session_id, chainIds: chainSessionIds(chain) })
+        records.push({
+          sessionId: row.session_id,
+          nativeId:
+            typeof row.adopted_native_id === 'string' && row.adopted_native_id.length > 0
+              ? row.adopted_native_id
+              : null,
+          chainIds: chainSessionIds(chain)
+        })
       }
       return records
     },

@@ -118,7 +118,7 @@ test('does not signal when no claude process carries the session id', async () =
 test('reads the handle chain once even when the row id already matches a process', async () => {
   const { ops, recordReads } = fakeOps({
     table: processTable(SESSION_ID),
-    records: [{ sessionId: 'orcasession-0000-1111', chainIds: [SESSION_ID] }]
+    records: [{ sessionId: 'orcasession-0000-1111', nativeId: SESSION_ID, chainIds: [SESSION_ID] }]
   })
 
   await stopSessionWithSignal({ workspaceId: 'w1', sessionId: SESSION_ID, dryRun: true, ops })
@@ -208,7 +208,13 @@ test('a dry run reports the process and signals nothing', async () => {
 test('falls back to the stored handle chain when the row id is Orca’s own', async () => {
   const { ops, signalled } = fakeOps({
     table: processTable(SESSION_ID),
-    records: [{ sessionId: 'orcasession-0000-1111', chainIds: ['older-session', SESSION_ID] }]
+    records: [
+      {
+        sessionId: 'orcasession-0000-1111',
+        nativeId: SESSION_ID,
+        chainIds: ['older-session', SESSION_ID]
+      }
+    ]
   })
 
   const outcome = await stopSessionWithSignal({
