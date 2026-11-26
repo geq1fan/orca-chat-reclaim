@@ -1,0 +1,10 @@
+node_modules/
+.orca/
+.agent/
+.agents/
+.claude/
+.gemini/
+.pi/
+.impeccable/
+.cursor/
+.codex/

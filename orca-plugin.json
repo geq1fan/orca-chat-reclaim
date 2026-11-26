@@ -1,0 +1,41 @@
+{
+  "manifestVersion": 2,
+  "id": "chat-reclaim",
+  "name": "会话资源",
+  "version": "0.1.0",
+  "description": "按工作区列出 agent 会话，逐个或批量关闭空闲（done）会话，补上 Orca 资源面板缺失的关闭按钮。",
+  "engines": {
+    "orca": ">=1.4.259"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "chat-reclaim",
+        "title": "会话资源",
+        "icon": "agent",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "workspace:write"
+    },
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "terminal:send"
+    }
+  ]
+}
