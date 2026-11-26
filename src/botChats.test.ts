@@ -1,5 +1,6 @@
 import { assert, test } from 'orca/testing'
 import { buildTitleMap, type ChatTitleOps } from './botChats'
+import { aliasTitles } from './sessionRecord'
 
 function ops(overrides: Partial<ChatTitleOps> = {}): ChatTitleOps {
   return {
@@ -8,15 +9,27 @@ function ops(overrides: Partial<ChatTitleOps> = {}): ChatTitleOps {
       bot === '小小'
         ? [{ id: 'orca-1', title: 'Took over 错题本三期' }]
         : [{ id: 'orca-2', title: '上线单 13703928' }],
-    sessionPairs: async () => [{ sessionId: 'orca-1', nativeId: 'native-1' }],
     ...overrides
   }
 }
 
-test('titles answer for both the Orca id and the provider id', async () => {
+test('the title table is keyed by Orca session id', async () => {
   const titles = await buildTitleMap(ops())
 
+  assert.deepEqual(titles, {
+    'orca-1': 'Took over 错题本三期',
+    'orca-2': '上线单 13703928'
+  })
+})
+
+test('a record aliases its title onto every conversation id in its chain', async () => {
+  // A rewind keeps the old provider id in the chain; both must answer with the same title.
+  const titles = aliasTitles(await buildTitleMap(ops()), [
+    { sessionId: 'orca-1', chainIds: ['native-old', 'native-1'] }
+  ])
+
   assert.equal(titles['orca-1'], 'Took over 错题本三期')
+  assert.equal(titles['native-old'], 'Took over 错题本三期')
   assert.equal(titles['native-1'], 'Took over 错题本三期')
   assert.equal(titles['orca-2'], '上线单 13703928')
 })
@@ -34,18 +47,6 @@ test('one unreachable bot does not cost the others their titles', async () => {
   assert.deepEqual(titles, { 'orca-2': '上线单 13703928' })
 })
 
-test('an unreadable session database still answers for Orca ids', async () => {
-  const titles = await buildTitleMap(
-    ops({
-      sessionPairs: async () => {
-        throw new Error('database is locked')
-      }
-    })
-  )
-
-  assert.deepEqual(Object.keys(titles).sort(), ['orca-1', 'orca-2'])
-})
-
 test('an unreachable bot list yields no titles instead of throwing', async () => {
   const titles = await buildTitleMap(
     ops({
@@ -60,6 +61,12 @@ test('an unreachable bot list yields no titles instead of throwing', async () =>
 
 test('a chat without a title is skipped', async () => {
   const titles = await buildTitleMap(ops({ chats: async () => [{ id: 'orca-3', title: '' }] }))
+
+  assert.deepEqual(titles, {})
+})
+
+test('a record without a title lends none to its chain ids', async () => {
+  const titles = aliasTitles({}, [{ sessionId: 'orca-1', chainIds: ['native-1'] }])
 
   assert.deepEqual(titles, {})
 })

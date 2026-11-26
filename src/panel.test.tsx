@@ -17,7 +17,8 @@ function row(overrides: Partial<SessionRow>): SessionRow {
     state: 'done',
     stateStartedAt: Date.now() - 60_000,
     sessionId: 'session-t1',
-    hasProcess: null,
+    process: null,
+    matchedId: null,
     ...overrides
   }
 }
@@ -75,7 +76,6 @@ const snapshot: SessionSnapshot = {
   workspacesTruncated: false,
   failedWorkspaces: 0,
   recentOps: [],
-  currentSessionId: null
 }
 
 test('groups sessions by workspace and counts the idle ones of the focused workspace', async () => {
@@ -108,14 +108,13 @@ test('a done chat with a session id can be closed', async () => {
         terminalId: null,
         title: '会话 39e65ad8',
         sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
-        hasProcess: true
+        process: 'running'
       })
     ],
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
     recentOps: [],
-    currentSessionId: null
   }
   view = await mount(panel, {
     host: mockHost({
@@ -147,18 +146,17 @@ test('a done chat with a session id can be closed', async () => {
 test('a done session with no terminal and no session id cannot be closed', async () => {
   const orphan: SessionSnapshot = {
     workspaces: [{ id: 'w1', name: '工作区一', kind: 'worktree', terminalCount: 0 }],
-    sessions: [row({ terminalId: null, sessionId: null, title: '无句柄会话' })],
+    sessions: [row({ terminalId: null, sessionId: null, title: '无句柄会话', process: 'stopped' })],
     currentWorkspaceId: 'w1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
     recentOps: [],
-    currentSessionId: null
   }
   view = await mount(panel, {
-    host: mockHost({ storage: stored(['w1']), requests: { 'sessions.list': () => orphan } })
+    host: mockHost({ storage: stored(['w1'], true), requests: { 'sessions.list': () => orphan } })
   })
 
-  assert.ok(view.find({ role: 'button', text: '无法关闭' }))
+  assert.equal(view.find({ role: 'button', text: '未运行' })?.disabled, true)
   assert.ok(view.find({ text: /空闲 1 个 · 可回收 0 个/ }))
   assert.deepEqual(view.errors, [])
 })
@@ -267,7 +265,7 @@ test('shows the recent operations log', async () => {
   assert.ok(view.find({ text: /最近操作 \(1\)/ }))
   assert.deepEqual(view.errors, [])
 })
-test('a done chat whose process already exited is greyed and says why', async () => {
+test('a done chat whose ids matched no process is 无法判定 and greyed', async () => {
   const exited: SessionSnapshot = {
     workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
     sessions: [
@@ -278,21 +276,20 @@ test('a done chat whose process already exited is greyed and says why', async ()
         terminalId: null,
         title: '会话 1d5698f7',
         sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
-        hasProcess: false
+        process: 'unknown'
       })
     ],
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
     recentOps: [],
-    currentSessionId: null
   }
   view = await mount(panel, {
     host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => exited } })
   })
 
-  assert.equal(view.find({ role: 'button', text: '未运行' })?.disabled, true)
-  assert.ok(view.find({ text: '未运行' }))
+  assert.equal(view.find({ role: 'button', text: '无法判定' })?.disabled, true)
+  assert.ok(view.find({ text: '无法判定' }))
   assert.ok(view.find({ text: /可回收 0 个/ }))
   assert.deepEqual(view.errors, [])
 })
@@ -331,7 +328,7 @@ test('shows the chat title above the session id, truncating a long one', async (
         terminalId: null,
         title: 'Took over 错题本三期',
         sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
-        hasProcess: true
+        process: 'running'
       }),
       row({
         workspaceId: 'folder:1',
@@ -340,14 +337,13 @@ test('shows the chat title above the session id, truncating a long one', async (
         terminalId: null,
         title: longTitle,
         sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
-        hasProcess: false
+        process: 'unknown'
       })
     ],
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
     recentOps: [],
-    currentSessionId: null
   }
   view = await mount(panel, {
     host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => titled } })
@@ -359,8 +355,7 @@ test('shows the chat title above the session id, truncating a long one', async (
   assert.deepEqual(view.errors, [])
 })
 
-test('a chat with a live process reads 空闲, and the chat the panel is in is skipped', async () => {
-  const currentSession = '39e65ad8-b388-4e57-8d80-e3ad8dc791e8'
+test('a chat with a live process reads 空闲, and every finished one is reclaimable', async () => {
   const live: SessionSnapshot = {
     workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
     sessions: [
@@ -370,9 +365,9 @@ test('a chat with a live process reads 空闲, and the chat the panel is in is s
         workspaceKind: 'folder',
         terminalId: null,
         title: 'Took over 错题本三期',
-        sessionId: currentSession,
+        sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
         stateStartedAt: Date.now() - 60_000,
-        hasProcess: true
+        process: 'running'
       }),
       row({
         workspaceId: 'folder:1',
@@ -382,28 +377,25 @@ test('a chat with a live process reads 空闲, and the chat the panel is in is s
         title: '每日记忆维护 run 5',
         sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
         stateStartedAt: Date.now() - 3_600_000,
-        hasProcess: true
+        process: 'running'
       })
     ],
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
     recentOps: [],
-    currentSessionId: currentSession
   }
   view = await mount(panel, {
     host: mockHost({ storage: stored(['folder:1']), requests: { 'sessions.list': () => live } })
   })
 
-  // Both rows have a live process, so both read 空闲 rather than 已结束.
+  // Both rows have a live process, so both read 空闲 rather than 已结束, and both can be reclaimed.
   assert.equal(view.findAll({ text: '空闲' }).length >= 2, true)
-  assert.ok(view.find({ text: /已跳过当前使用的会话「Took over 错题本三期」/ }))
-  // Reclaim counts only the other chat.
-  assert.ok(view.find({ role: 'button', text: '回收空闲 (1)' }))
+  assert.ok(view.find({ role: 'button', text: '回收空闲 (2)' }))
 
-  await view.press({ role: 'button', text: '回收空闲 (1)' })
+  await view.press({ role: 'button', text: '回收空闲 (2)' })
   assert.ok(
-    view.find({ text: /将关闭当前工作区「小小」里 1 个会话：「每日记忆维护 run 5」；当前使用的会话「Took over 错题本三期」会跳过/ })
+    view.find({ text: /将关闭当前工作区「小小」里 2 个会话：「Took over 错题本三期」「每日记忆维护 run 5」/ })
   )
   assert.deepEqual(view.errors, [])
 })
@@ -418,7 +410,7 @@ const mixed: SessionSnapshot = {
       terminalId: null,
       title: 'Home',
       sessionId: 'home-provider',
-      hasProcess: true
+      process: 'running'
     }),
     row({
       workspaceId: 'folder:9',
@@ -428,7 +420,7 @@ const mixed: SessionSnapshot = {
       title: '正在跑的另一条',
       sessionId: 'busy-provider',
       state: 'working',
-      hasProcess: true
+      process: 'running'
     }),
     row({
       workspaceId: 'folder:9',
@@ -437,14 +429,13 @@ const mixed: SessionSnapshot = {
       terminalId: null,
       title: '未运行的那条',
       sessionId: null,
-      hasProcess: false
+      process: 'stopped'
     })
   ],
   currentWorkspaceId: 'folder:9',
   workspacesTruncated: false,
   failedWorkspaces: 0,
   recentOps: [],
-  currentSessionId: 'home-provider'
 }
 
 test('groups start folded, and unfolding one is remembered', async () => {
@@ -455,7 +446,8 @@ test('groups start folded, and unfolding one is remembered', async () => {
   // Folded: no session rows, but the group header still carries the counts.
   assert.equal(view.find({ text: 'Home' }), null)
   assert.ok(view.find({ text: /在运行 2 · 未运行 1/ }))
-  assert.ok(view.find({ text: /在运行 2 条 · 未运行 1 条已隐藏/ }))
+  assert.ok(view.find({ text: 'Orca 会话 3 条 · 匹配到进程 2 条' }))
+  assert.ok(view.find({ text: /其余 1 条已确认未运行已隐藏/ }))
 
   await view.press({ role: 'button', text: '小小' })
   assert.ok(view.find({ text: 'Home' }))
@@ -465,7 +457,7 @@ test('groups start folded, and unfolding one is remembered', async () => {
   assert.deepEqual(view.errors, [])
 })
 
-test('the 显示未运行 switch shows stopped rows and remembers its state', async () => {
+test('the 显示无进程 switch shows unjudged rows and remembers its state', async () => {
   view = await mount(panel, {
     host: mockHost({
       storage: stored(['folder:9']),
@@ -476,17 +468,17 @@ test('the 显示未运行 switch shows stopped rows and remembers its state', as
   // The unfolded group is remembered, but stopped rows stay hidden until the switch is on.
   assert.ok(view.find({ text: 'Home' }))
   assert.equal(view.find({ text: '未运行的那条' }), null)
-  assert.equal(view.find({ text: '在运行 2 条 · 未运行 1 条' }), null)
+  assert.ok(view.find({ text: /其余 1 条已确认未运行已隐藏/ }))
 
-  await view.toggle({ label: '显示未运行 (1)' })
+  await view.toggle({ label: '显示无进程 (1)' })
 
   assert.ok(view.find({ text: '未运行的那条' }))
   assert.equal(view.persisted.storage.showStopped, true)
-  assert.ok(view.find({ text: /在运行 2 条 · 未运行 1 条/ }))
+  assert.ok(view.find({ text: /其余 1 条已确认未运行（已显示）/ }))
   assert.deepEqual(view.errors, [])
 })
 
-test('stopped-only workspace groups stay hidden until 显示未运行 is toggled on', async () => {
+test('workspaces with only unmatched sessions stay hidden until 显示无进程 is toggled on', async () => {
   const withStoppedGroup: SessionSnapshot = {
     workspaces: [
       { id: 'w-active', name: '运行工作区', kind: 'worktree', terminalCount: 1 },
@@ -501,14 +493,13 @@ test('stopped-only workspace groups stay hidden until 显示未运行 is toggled
         terminalId: null,
         sessionId: null,
         title: 'Stopped only',
-        hasProcess: false
+        process: 'stopped'
       })
     ],
     currentWorkspaceId: 'w-active',
     workspacesTruncated: false,
     failedWorkspaces: 0,
     recentOps: [],
-    currentSessionId: null
   }
   view = await mount(panel, {
     host: mockHost({ requests: { 'sessions.list': () => withStoppedGroup } })
@@ -517,7 +508,7 @@ test('stopped-only workspace groups stay hidden until 显示未运行 is toggled
   assert.ok(view.find({ text: '运行工作区' }))
   assert.equal(view.find({ text: '纯休眠工作区' }), null)
 
-  await view.toggle({ label: '显示未运行 (1)' })
+  await view.toggle({ label: '显示无进程 (1)' })
 
   assert.ok(view.find({ text: '纯休眠工作区' }))
   assert.deepEqual(view.errors, [])
@@ -534,28 +525,27 @@ test('shows an actionable empty state when all sessions are stopped and hidden',
         terminalId: null,
         sessionId: null,
         title: '休眠会话',
-        hasProcess: false
+        process: 'stopped'
       })
     ],
     currentWorkspaceId: 'w-stopped',
     workspacesTruncated: false,
     failedWorkspaces: 0,
     recentOps: [],
-    currentSessionId: null
   }
   view = await mount(panel, {
     host: mockHost({ requests: { 'sessions.list': () => allStopped } })
   })
 
   assert.ok(view.find({ label: '没有正在运行的会话' }))
-  await view.press({ role: 'button', text: '显示未运行 (1)' })
+  await view.press({ role: 'button', text: '显示无进程 (1)' })
 
   assert.ok(view.find({ text: '纯休眠工作区' }))
   assert.equal(view.persisted.storage.showStopped, true)
   assert.deepEqual(view.errors, [])
 })
 
-test('tags the row matching currentSessionId with 当前会话 badge', async () => {
+test('the reconciliation line says how many sessions matched a process', async () => {
   view = await mount(panel, {
     host: mockHost({
       storage: stored(['folder:9']),
@@ -563,7 +553,9 @@ test('tags the row matching currentSessionId with 当前会话 badge', async () 
     })
   })
 
-  assert.ok(view.find({ text: '当前会话' }))
+  assert.ok(view.find({ text: 'Orca 会话 3 条 · 匹配到进程 2 条' }))
+  assert.ok(view.find({ text: /其余 1 条已确认未运行/ }))
+  assert.equal(view.find({ text: '当前会话' }), null)
   assert.deepEqual(view.errors, [])
 })
 

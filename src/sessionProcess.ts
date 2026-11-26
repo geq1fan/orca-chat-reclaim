@@ -1,12 +1,12 @@
 import { messageOf } from './errors'
 import type { CloseOutcome } from './protocol'
-import { findClaudeTarget, parseProcessTable, type ClaudeTarget } from './processTable'
-import { nativeSessionId } from './sessionRecord'
+import { findClaudeTargetAmong, parseProcessTable } from './processTable'
+import { sessionCandidates, type SessionRecord } from './sessionRecord'
 
 /** Everything `stopSessionWithSignal` needs from the machine; tests pass fakes. */
 export type SignalOps = {
-  /** The stored `providerHandleChain` JSON for an Orca session id, or null when there is none. */
-  readHandleChain(sessionId: string): Promise<string | null>
+  /** Every stored Orca session with the conversation ids in its handle chain. */
+  listSessionRecords(): Promise<SessionRecord[]>
   /** `ps -Ao pid,ppid,pgid,command` output. */
   listProcesses(): Promise<string>
   /** SIGTERM to the whole process group. */
@@ -21,11 +21,12 @@ export const TERM_WAIT_MS = 5000
 export const TERM_POLL_MS = 250
 
 /**
- * Stops a chat session by SIGTERM-ing the claude process group that runs it. Nothing is signalled
- * unless the process is the `.local/bin/claude` started by `orca-provider-exec`, is its own
- * process group, and (with `dryRun`) nothing is signalled at all — it only reports what it found.
- * A TERM that does not take the process down in five seconds is reported as a failure; this never
- * escalates to SIGKILL.
+ * Stops a chat session by SIGTERM-ing the claude process group that runs it. The session's own id
+ * and every id in its stored handle chain are candidates, so a rewind that moved the process to
+ * a new conversation id still reaches it. Nothing is signalled unless the process is the
+ * `.local/bin/claude` started by `orca-provider-exec`, is its own process group, and (with
+ * `dryRun`) nothing is signalled at all — it only reports what it found. A TERM that does not
+ * take the process down in five seconds is reported as a failure; this never escalates to SIGKILL.
  */
 export async function stopSessionWithSignal(options: {
   workspaceId: string
@@ -45,45 +46,24 @@ export async function stopSessionWithSignal(options: {
     return { ...base, ok: false, code: 'ps_failed', message: `读进程表失败：${messageOf(error)}` }
   }
 
+  let records: SessionRecord[] = []
+  try {
+    records = await ops.listSessionRecords()
+  } catch (error) {
+    // Without the chain only the id the row carries can be matched; the refusal names why.
+    notes.push(`读会话数据库失败：${messageOf(error)}`)
+  }
+  const candidates = sessionCandidates(records, sessionId)
+
   const ownPgid = await ops.ownPgid().catch(() => null)
+  const found = findClaudeTargetAmong(table, candidates.length > 0 ? candidates : [sessionId], ownPgid)
 
-  // The id `agents.list` reports is already the provider id, so try it against `ps` first;
-  // only when nothing carries it is the stored session record worth a sqlite read.
-  let matched: { target: ClaudeTarget; providerId: string } | null = null
-  let refusal: { code: string; message: string } | null = null
-
-  const direct = findClaudeTarget(table, sessionId, ownPgid)
-  if (direct.ok) {
-    matched = { target: direct.target, providerId: sessionId }
-  } else {
-    refusal = { code: direct.code, message: direct.message }
-  }
-
-  if (!direct.ok && direct.code === 'no_process') {
-    let fromRecord: string | null = null
-    try {
-      fromRecord = nativeSessionId(await ops.readHandleChain(sessionId))
-    } catch (error) {
-      notes.push(`读会话数据库失败：${messageOf(error)}`)
-    }
-    if (fromRecord && fromRecord !== sessionId) {
-      const fallback = findClaudeTarget(table, fromRecord, ownPgid)
-      if (fallback.ok) matched = { target: fallback.target, providerId: fromRecord }
-      else refusal = { code: fallback.code, message: fallback.message }
-    }
-  }
-
-  if (!matched) {
+  if (!found.ok) {
     const notesText = notes.length > 0 ? `；${notes.join('；')}` : ''
-    return {
-      ...base,
-      ok: false,
-      code: refusal?.code ?? 'no_process',
-      message: `${refusal?.message ?? '没有找到运行中的进程'}${notesText}`
-    }
+    return { ...base, ok: false, code: found.code, message: `${found.message}${notesText}` }
   }
 
-  const { target, providerId } = matched
+  const { target, providerId } = found
   const detail = {
     sessionUuid: providerId,
     pid: target.pid,

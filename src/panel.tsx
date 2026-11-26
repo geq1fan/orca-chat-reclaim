@@ -27,7 +27,7 @@ import {
 } from 'orca'
 import { AGENT_STATE_LABEL, truncateTitle } from './labels'
 import type { OpRecord, SessionRow, SessionSnapshot } from './protocol'
-import { groupSessions, selectDone, selectIdle, type SessionGroup } from './sessions'
+import { groupSessions, isRunning, selectDone, selectIdle, type SessionGroup } from './sessions'
 
 /** What the worker last reported; null until the first answer arrives. */
 const snapshot = atom<SessionSnapshot | null>('snapshot', null)
@@ -45,15 +45,10 @@ const notice = atom<string | null>('notice', null)
 const stale = atom<boolean>('stale', false)
 /** The last close outcome per row, shown inside the row: a click must always answer visibly. */
 const rowResults = atom<Record<string, { ok: boolean; text: string }>>('rowResults', {})
-/** Hidden by default: a stopped chat has nothing to reclaim and only makes the list long. */
+/** Hidden by default: a row with no matched process only makes the list long. */
 const showStopped = atom<boolean>('showStopped', false, { persist: 'storage' })
 /** Which workspaces are unfolded, by workspace id; a group with no entry starts folded. */
 const expandedGroups = atom<Record<string, boolean>>('expandedGroups', {}, { persist: 'storage' })
-
-/** A row whose process is gone is not running; that is the set hidden by default. */
-function isStopped(row: SessionRow): boolean {
-  return row.hasProcess === false
-}
 
 function toggleGroup(workspaceId: string): void {
   update(expandedGroups, (current) => ({ ...current, [workspaceId]: !current[workspaceId] }))
@@ -62,11 +57,13 @@ function toggleGroup(workspaceId: string): void {
 type DisplayState = { label: string; tone: Tone }
 
 /**
- * The badge follows the process, not the agent's last reported state: a chat whose process has
- * exited has not "finished", it is simply not running and will come back when it is woken.
+ * The badge follows the process, not the agent's last reported state. A chat whose ids matched no
+ * process is 「无法判定」, not 「未运行」: Orca can report a stale id, and only a session with no
+ * candidate id at all is confirmed not to have a process.
  */
 function displayState(row: SessionRow): DisplayState {
-  if (row.hasProcess === false) return { label: '未运行', tone: 'neutral' }
+  if (row.process === 'stopped') return { label: '未运行', tone: 'neutral' }
+  if (row.process === 'unknown') return { label: '无法判定', tone: 'warning' }
   if (row.state === 'working') return { label: '运行中', tone: 'accent' }
   if (row.state === 'blocked') return { label: '待确认', tone: 'warning' }
   if (row.state === 'waiting') return { label: '等待中', tone: 'neutral' }
@@ -103,9 +100,8 @@ function canClose(row: SessionRow): boolean {
   if (row.state !== 'done') return false
   if (row.terminalId !== null) return true
   if (row.sessionId === null) return false
-  // Unknown (the process table could not be read) stays clickable: the click reports the truth,
-  // while `false` means there is nothing running to close and the button is greyed.
-  return row.hasProcess !== false
+  // Only a matched process can be signalled; `unknown` must not make the button promise a close.
+  return row.process === 'running'
 }
 
 function setRowResult(key: string, result: { ok: boolean; text: string }): void {
@@ -165,16 +161,13 @@ async function reclaimIdle(workspaceId: string): Promise<void> {
         setRowResult(outcome.sessionId, { ok: false, text: `关闭失败：${outcome.message}` })
       }
     }
-    const skipped = result.skipped
-      ? `跳过当前使用的会话「${truncateTitle(result.skipped.title, 20)}」。`
-      : ''
     if (failed && !failed.ok) {
       set(
         actionError,
-        `回收中断：已关闭 ${closed} 个，其余未动 —— ${failed.message}（${failed.code}）。${skipped}`
+        `回收中断：已关闭 ${closed} 个，其余未动 —— ${failed.message}（${failed.code}）。`
       )
     } else {
-      set(notice, `回收完成：已关闭 ${closed} 个空闲会话。${skipped}`)
+      set(notice, `回收完成：已关闭 ${closed} 个空闲会话。`)
     }
   } catch (error) {
     set(actionError, `回收失败：${describe(error)}`)
@@ -205,29 +198,28 @@ export function setup(ctx: PanelContext): void {
   void refresh(false)
 }
 
-function renderRow(row: SessionRow, currentSessionId: string | null): OrcaNode {
+function renderRow(row: SessionRow): OrcaNode {
   const key = rowKey(row)
   const confirmingThis = read(confirming) === key
   const busyThis = read(busyKey) === key
   const otherBusy = read(busyKey) !== null && !busyThis
   const closeable = canClose(row)
-  /** A finished chat whose process already exited: nothing left to close, say so up front. */
-  const exited = row.hasProcess === false
-  const shortId = row.sessionId?.slice(0, 8) ?? row.terminalId
+  /** Why the process is not a close target, when it is not. */
+  const unavailable = row.process === 'stopped' ? '未运行' : row.process === 'unknown' ? '无法判定' : null
+  // The same id the title was looked up with: the one the matched process answered to.
+  const shortId = (row.matchedId ?? row.sessionId)?.slice(0, 8) ?? row.terminalId
   const lastResult = read(rowResults)[key]
   const state = displayState(row)
-  const isCurrentSession = currentSessionId !== null && row.sessionId === currentSessionId
 
   return (
     <Box direction="column" gap="xs" padding="sm">
       <Row justify="between" align="center" gap="sm">
         <Box direction="column" gap="xs" grow>
-          <Text size="sm" weight="medium" muted={exited} truncate>
+          <Text size="sm" weight="medium" muted={!isRunning(row)} truncate>
             {truncateTitle(row.title)}
           </Text>
           <Row gap="xs" align="center" wrap>
             <Badge tone={state.tone}>{state.label}</Badge>
-            {isCurrentSession ? <Badge tone="accent">当前会话</Badge> : null}
             <Text muted size="xs">
               {row.agent}
             </Text>
@@ -258,12 +250,14 @@ function renderRow(row: SessionRow, currentSessionId: string | null): OrcaNode {
                 tooltip={
                   row.state !== 'done'
                     ? `只有 done 的会话能关，现在是「${AGENT_STATE_LABEL[row.state]}」`
-                    : exited
-                      ? '这个会话的进程没有在跑（未运行），没有可关闭的东西；下次发消息会重新拉起'
-                      : '这个会话没有终端也没有 sessionId，没法定位进程'
+                    : row.process === 'unknown'
+                      ? '没有进程命中这个会话的候选 id，无法判定它是否还在跑；先刷新确认'
+                      : row.process === 'stopped'
+                        ? '这个会话没有任何可用 id，也没有进程在跑（未运行）'
+                        : '这个会话没有终端也没有 sessionId，没法定位进程'
                 }
               >
-                {exited ? '未运行' : row.state === 'done' ? '无法关闭' : '关闭'}
+                {unavailable ?? (row.state === 'done' ? '无法关闭' : '关闭')}
               </Button>
             ) : (
               <Button
@@ -363,25 +357,25 @@ function renderRecentOps(records: OpRecord[]): OrcaNode {
   )
 }
 
-function formatGroupCount(running: number, stopped: number): string {
-  if (running > 0 && stopped > 0) return `在运行 ${running} · 未运行 ${stopped}`
-  if (running > 0) return `在运行 ${running}`
-  return `未运行 ${stopped}`
+function formatGroupCount(running: number, unknown: number, stopped: number): string {
+  const parts: string[] = []
+  if (running > 0) parts.push(`在运行 ${running}`)
+  if (unknown > 0) parts.push(`无法判定 ${unknown}`)
+  if (stopped > 0) parts.push(`未运行 ${stopped}`)
+  return parts.join(' · ')
 }
 
 function renderGroup(
   group: SessionGroup,
   currentWorkspaceId: string | null,
-  currentSessionId: string | null,
   showStoppedRows: boolean,
   expanded: boolean
 ): OrcaNode {
-  const running = group.sessions.filter((session) => !isStopped(session)).length
-  const stopped = group.sessions.length - running
-  const visible = showStoppedRows
-    ? group.sessions
-    : group.sessions.filter((session) => !isStopped(session))
-  const countText = formatGroupCount(running, stopped)
+  const running = group.sessions.filter(isRunning).length
+  const unknown = group.sessions.filter((session) => session.process === 'unknown').length
+  const stopped = group.sessions.filter((session) => session.process === 'stopped').length
+  const visible = showStoppedRows ? group.sessions : group.sessions.filter(isRunning)
+  const countText = formatGroupCount(running, unknown, stopped)
 
   return (
     <Box
@@ -419,14 +413,14 @@ function renderGroup(
               {visible.map((session, index) => (
                 <Box key={`${rowKey(session)}:${index}`} direction="column" gap="none">
                   {index > 0 ? <Separator /> : null}
-                  {renderRow(session, currentSessionId)}
+                  {renderRow(session)}
                 </Box>
               ))}
             </Box>
           ) : (
             <Box padding="sm">
               <Text muted size="xs">
-                这个工作区只有未运行的会话，打开「显示未运行」开关查看。
+                这个工作区没有匹配到进程的会话，打开「显示无进程」开关查看。
               </Text>
             </Box>
           )}
@@ -442,26 +436,26 @@ export default function Panel(): OrcaNode {
   const isStale = read(stale)
   const currentWorkspaceId = view?.currentWorkspaceId ?? null
   const currentWorkspace = view?.workspaces.find((workspace) => workspace.id === currentWorkspaceId)
-  const currentSessionId = view?.currentSessionId ?? null
   const idle =
-    view && currentWorkspaceId
-      ? selectIdle(view.sessions, currentWorkspaceId, currentSessionId)
-      : []
+    view && currentWorkspaceId ? selectIdle(view.sessions, currentWorkspaceId) : []
   const idleAll = view && currentWorkspaceId ? selectDone(view.sessions, currentWorkspaceId) : []
-  const currentRow =
-    view && currentSessionId
-      ? (view.sessions.find((session) => session.sessionId === currentSessionId) ?? null)
-      : null
   const showStoppedRows = read(showStopped)
   const expandedByWorkspace = read(expandedGroups)
-  const runningCount = view ? view.sessions.filter((session) => !isStopped(session)).length : 0
-  const stoppedCount = view ? view.sessions.length - runningCount : 0
+  const runningCount = view ? view.sessions.filter(isRunning).length : 0
+  const unknownCount = view
+    ? view.sessions.filter((session) => session.process === 'unknown').length
+    : 0
+  const stoppedCount = view
+    ? view.sessions.filter((session) => session.process === 'stopped').length
+    : 0
+  const unmatchedCount = view ? view.sessions.length - runningCount : 0
+  const totalCount = view ? view.sessions.length : 0
   const isAsking = read(askingReclaim)
   const isReclaiming = read(reclaiming)
   const allGroups = view ? groupSessions(view) : []
   const visibleGroups = showStoppedRows
     ? allGroups
-    : allGroups.filter((group) => group.sessions.some((session) => !isStopped(session)))
+    : allGroups.filter((group) => group.sessions.some(isRunning))
 
   return (
     <Stack gap="md">
@@ -512,11 +506,6 @@ export default function Panel(): OrcaNode {
           <Text size="sm" weight="semibold" truncate>
             {currentWorkspace?.name ?? '未选中'}
           </Text>
-          {currentRow ? (
-            <Text muted size="xs" truncate>
-              {`已跳过当前使用的会话「${truncateTitle(currentRow.title, 20)}」`}
-            </Text>
-          ) : null}
           {isStale ? (
             <Text tone="warning" size="xs">
               有新状态变化，刷新后再回收
@@ -531,16 +520,12 @@ export default function Panel(): OrcaNode {
             <Text size="sm">
               {idle.length === 0 || currentWorkspaceId === null
                 ? idleAll.length > 0
-                  ? `当前工作区有 ${idleAll.length} 个 done 会话，但它们都没有终端也没有 sessionId，这里关不掉。`
+                  ? `当前工作区有 ${idleAll.length} 个 done 会话，但它们都没有可关闭的进程（没有终端，也没有命中 claude 进程）。`
                   : '当前工作区没有状态为 done 的会话，无需回收。'
                 : `将关闭当前工作区「${currentWorkspace?.name ?? currentWorkspaceId}」里 ${idle.length} 个会话：${idle
                     .slice(0, 3)
                     .map((session) => `「${truncateTitle(session.title, 20)}」`)
-                    .join('')}${idle.length > 3 ? ` 等 ${idle.length} 个` : ''}${
-                    currentRow
-                      ? `；当前使用的会话「${truncateTitle(currentRow.title, 20)}」会跳过`
-                      : ''
-                  }。带终端的走 terminal.close，chat 会话向它的 claude 进程组发 SIGTERM，进程会随之结束，无法撤销。`}
+                    .join('')}${idle.length > 3 ? ` 等 ${idle.length} 个` : ''}。带终端的走 terminal.close，chat 会话向它的 claude 进程组发 SIGTERM，进程会随之结束，无法撤销。`}
             </Text>
             {isStale ? (
               <Text muted size="xs">
@@ -628,29 +613,36 @@ export default function Panel(): OrcaNode {
         <Stack gap="sm">
           <Row justify="between" align="center" gap="xs" wrap>
             <Text muted size="xs">
-              {stoppedCount > 0
-                ? `在运行 ${runningCount} 条 · 未运行 ${stoppedCount} 条${showStoppedRows ? '' : '已隐藏'}`
-                : `在运行 ${runningCount} 条`}
+              {`Orca 会话 ${totalCount} 条 · 匹配到进程 ${runningCount} 条`}
             </Text>
-            {stoppedCount > 0 ? (
+            {unmatchedCount > 0 ? (
               <Box shrink={false}>
                 <Switch
-                  label={`显示未运行 (${stoppedCount})`}
+                  label={`显示无进程 (${unmatchedCount})`}
                   checked={showStoppedRows}
                   onChange={(checked) => set(showStopped, checked)}
                 />
               </Box>
             ) : null}
           </Row>
+          {unmatchedCount > 0 ? (
+            <Text muted size="xs">
+              {`其余 ${unmatchedCount} 条${
+                unknownCount > 0 ? `中 ${unknownCount} 条无法判定` : '已确认未运行'
+              }${unknownCount > 0 && stoppedCount > 0 ? `，${stoppedCount} 条确认未运行` : ''}${
+                showStoppedRows ? '（已显示）' : '已隐藏'
+              }。`}
+            </Text>
+          ) : null}
 
           {visibleGroups.length === 0 ? (
             <EmptyState
               title="没有正在运行的会话"
-              description={`还有 ${stoppedCount} 条未运行会话已隐藏，打开上方开关或点击下方按钮查看。`}
+              description={`还有 ${unmatchedCount} 条没有匹配到进程的会话已隐藏，打开上方开关或点击下方按钮查看。`}
               icon="agent"
             >
               <Button size="sm" variant="outline" onPress={() => set(showStopped, true)}>
-                {`显示未运行 (${stoppedCount})`}
+                {`显示无进程 (${unmatchedCount})`}
               </Button>
             </EmptyState>
           ) : (
@@ -659,7 +651,6 @@ export default function Panel(): OrcaNode {
                 renderGroup(
                   group,
                   currentWorkspaceId,
-                  currentSessionId,
                   showStoppedRows,
                   expandedByWorkspace[group.workspace.id] === true
                 )
