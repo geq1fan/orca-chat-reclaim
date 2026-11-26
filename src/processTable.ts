@@ -35,9 +35,10 @@ const KIND_BY_BINARY: Record<string, string> = {
 /**
  * Agent kinds whose CLI takes a conversation id (`--resume=` / `--session-id=`). A live process
  * of the kind is evidence enough; this list covers the case where none is running, so a plain
- * miss is not described as "this agent has no ids".
+ * miss is not described as "this agent has no ids". pi is not here: its argv is only
+ * `pi --mode rpc` with no id, so it is paired by workspace directory like antigravity.
  */
-const ID_KINDS = new Set(['claude', 'pi', 'codex'])
+const ID_KINDS = new Set(['claude', 'codex'])
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')

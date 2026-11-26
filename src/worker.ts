@@ -157,7 +157,7 @@ type ListedAgent = {
 type KindPairing = {
   pid: number
   pgid: number
-  /** The kind's session count, which equals its process count — the basis of the pairing. */
+  /** The workspace's session count, equal to its cwd-matching process count — the basis. */
   count: number
 }
 
@@ -191,8 +191,10 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
     id: workspace.id,
     name: workspace.name,
     kind: workspace.kind,
+    path: workspace.path || null,
     terminalCount: workspace.status?.terminalCount ?? null
   }))
+  const workspacePaths = new Map(workspaces.map((workspace) => [workspace.id, workspace.path]))
 
   const scanned: { workspace: WorkspaceRow; agent: ListedAgent }[] = []
   let failedWorkspaces = 0
@@ -222,6 +224,7 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
             id: workspace.id,
             name: workspace.name,
             kind: workspace.kind,
+            path: workspace.path || null,
             terminalCount: workspace.status?.terminalCount ?? null
           },
           agent
@@ -244,35 +247,49 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
   })
 
   // Ids that matched nothing may belong to an agent kind that never puts an id on its command
-  // line. Only an exact 1:1 count is evidence of a pairing; any other count is left unjudged.
-  const pendingByKind = new Map<string, number[]>()
+  // line. Pair them inside their own workspace: only processes whose cwd is that workspace
+  // directory count, and only an exact per-workspace 1:1 count is evidence. Any other count is
+  // left unjudged — the machine-wide counts are not comparable, because other workspaces run the
+  // same kind too.
+  const pending = new Map<string, { workspaceId: string; kind: string; indexes: number[] }>()
   scanned.forEach((entry, index) => {
     if (entry.agent.terminalId !== null || processTable === null || matchedAt.has(index)) return
     const kind = entry.agent.agent ?? 'unknown'
     if (providesSessionId(kind, processes)) return
-    const members = pendingByKind.get(kind)
-    if (members) members.push(index)
-    else pendingByKind.set(kind, [index])
+    const key = `${entry.workspace.id}\u0000${kind}`
+    const group = pending.get(key)
+    if (group) group.indexes.push(index)
+    else pending.set(key, { workspaceId: entry.workspace.id, kind, indexes: [index] })
   })
 
+  // One `lsof` per pid, shared by every workspace: a pid can only have one cwd.
+  const cwdCache = new Map<number, string | null>()
+  const cwdOf = async (pid: number): Promise<string | null> => {
+    if (!cwdCache.has(pid)) {
+      cwdCache.set(pid, await signalOperations().processCwd(pid).catch(() => null))
+    }
+    return cwdCache.get(pid) ?? null
+  }
+
   const pairs = new Map<number, KindPairing>()
-  const pairingNotes = new Map<string, string>()
-  for (const [kind, indexes] of pendingByKind) {
-    if (failedWorkspaces > 0) {
-      pairingNotes.set(
-        kind,
-        `有 ${failedWorkspaces} 个工作区没读到，无法确认本机 ${kind} 的会话总数，不配对`
-      )
+  const pairingNotes = new Map<number, string>()
+  for (const { workspaceId, kind, indexes } of pending.values()) {
+    const workspacePath = workspacePaths.get(workspaceId) ?? null
+    if (!workspacePath) {
+      const note = `${kind} 不提供会话 id；读不到工作区 ${workspaceId} 的目录路径，无法按目录配对`
+      for (const index of indexes) pairingNotes.set(index, note)
       continue
     }
     const kindProcesses = processes
       .filter((process) => process.kind === kind && process.providerId === null)
       .sort((left, right) => left.row.pid - right.row.pid)
-    if (kindProcesses.length !== indexes.length) {
-      pairingNotes.set(
-        kind,
-        `${kind} 的命令行不带会话 id；本机这种会话 ${indexes.length} 个 / 进程 ${kindProcesses.length} 个，数量不等，不猜`
-      )
+    const inWorkspace = []
+    for (const process of kindProcesses) {
+      if ((await cwdOf(process.row.pid)) === workspacePath) inWorkspace.push(process)
+    }
+    if (inWorkspace.length !== indexes.length) {
+      const note = `${kind} 不提供会话 id；该工作区 ${indexes.length} 条会话 / ${inWorkspace.length} 个进程，数量不等，不猜`
+      for (const index of indexes) pairingNotes.set(index, note)
       continue
     }
     // Deterministic order, so the same machine state always yields the same pairings.
@@ -285,7 +302,7 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
     })
     for (let position = 0; position < ordered.length; position += 1) {
       const index = ordered[position]
-      const process = kindProcesses[position]
+      const process = inWorkspace[position]
       if (index === undefined || !process) continue
       pairs.set(index, { pid: process.row.pid, pgid: process.row.pgid, count: ordered.length })
     }
@@ -309,7 +326,7 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
       process = 'running'
     } else if (pair) {
       process = 'running'
-      processNote = `${kind} 不提供会话 id；本机这种会话 ${pair.count} 个、进程 ${pair.count} 个，1:1 配到 pid ${pair.pid}（pgid ${pair.pgid}）`
+      processNote = `${kind} 不提供会话 id；该工作区 ${pair.count} 条会话 / ${pair.count} 个进程 cwd 一致，1:1 配到 pid ${pair.pid}（pgid ${pair.pgid}）`
     } else if (candidates.length === 0) {
       // No id any process could carry, and no pairing to stand on: nothing here to run.
       process = 'stopped'
@@ -317,7 +334,7 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
       // Ids exist but none matched, or the id-less pairing refused: unjudged, never "not running".
       process = 'unknown'
       processNote =
-        pairingNotes.get(kind) ?? '会话 id 没有命中任何进程（进程可能已退出，或 ps 里看不到）'
+        pairingNotes.get(index) ?? '会话 id 没有命中任何进程（进程可能已退出，或 ps 里看不到）'
     }
 
     // The row shows the id its process answered to, and looks the title up by that same id.
@@ -495,8 +512,9 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
   const pid = typeof input.pid === 'number' ? input.pid : null
   if (pid !== null) {
     // The panel offers a pid only for an agent that carries no session id. Re-read the same
-    // pairing it drew before signalling: a changed count or a different pid is refused, because
-    // an id-less pairing is a count-based inference and may not outlive the snapshot that made it.
+    // pairing it drew before signalling: a changed per-workspace count, a different pid, or a
+    // process whose cwd left the workspace is refused, because an id-less pairing is a
+    // directory-and-count inference and may not outlive the snapshot that made it.
     const snapshot = await readSnapshot(orca, false)
     const row = snapshot.sessions.find(
       (session) =>
@@ -510,7 +528,7 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
           ...base,
           sessionId,
           code: 'pairing_changed',
-          message: '这个会话和进程的配对已经变了（数量不再一一对应），刷新确认后再关，不盲杀'
+          message: '这个会话和进程的配对已经变了（数量不再一一对应，或进程 cwd 已不在这个工作区），刷新确认后再关，不盲杀'
         },
         title
       )
@@ -526,11 +544,14 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
         title
       )
     }
+    const workspacePath =
+      snapshot.workspaces.find((workspace) => workspace.id === input.workspaceId)?.path ?? null
     const outcome = await stopPairedSession({
       workspaceId: input.workspaceId,
       sessionId,
       agent: row.agent,
       pid,
+      workspacePath,
       dryRun,
       ops: signalOperations()
     })

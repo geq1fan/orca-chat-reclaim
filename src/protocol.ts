@@ -48,6 +48,8 @@ export type WorkspaceRow = {
   id: string
   name: string
   kind: 'worktree' | 'folder'
+  /** The directory `workspace.list` gives; id-less agents are paired and re-checked against it. */
+  path: string | null
   terminalCount: number | null
 }
 

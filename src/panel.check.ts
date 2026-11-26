@@ -1,9 +1,9 @@
 // `orca plugin check` renders the panel once per scenario. `real` is a snapshot taken from the
 // live host during the 0.1.4 work, with the workspaces that hold no session dropped to keep the
 // fixture small. The three running 小小 claude chats match by the ids their processes carry; the
-// antigravity chat — whose CLI has no --session-id/--resume and shares its cwd with every other
-// chat — is paired one to one with the machine's only agy process (pid 8993); the finished chat
-// whose process is gone now names that reason instead of a bare 无法判定.
+// antigravity chat — whose CLI has no --session-id/--resume — is paired one to one with the
+// machine's only agy process in that workspace (pid 8993); the finished chat whose process is
+// gone now names that reason instead of a bare 无法判定.
 import { defineCheck, hostError } from 'orca/testing'
 import type { SessionSnapshot } from './protocol'
 
@@ -13,54 +13,63 @@ const real: SessionSnapshot = {
       "id": "identity:wt2:local:7072fb48-0d5c-413a-9d3e-f6a4830ae582",
       "name": "错题本三期",
       "kind": "worktree",
+      "path": null,
       "terminalCount": 1
     },
     {
       "id": "identity:wt2:local:aded6ef9-26a9-4d47-9d77-bb5218b60734",
       "name": "Fix remaining session mismatch",
       "kind": "worktree",
+      "path": null,
       "terminalCount": 0
     },
     {
       "id": "folder:f8168b9e-ba71-4fbf-9b41-2b152abde888",
       "name": "钉钉沟通助手",
       "kind": "folder",
+      "path": null,
       "terminalCount": 0
     },
     {
       "id": "folder:cf9721a4-3ce2-410f-87d5-55da80cefb6e",
       "name": "数据核查助手",
       "kind": "folder",
+      "path": null,
       "terminalCount": 0
     },
     {
       "id": "folder:52cc4ad7-ad59-4592-bf32-e6e3fe0734d5",
       "name": "方舟规则助手",
       "kind": "folder",
+      "path": null,
       "terminalCount": 0
     },
     {
       "id": "folder:7b3ccc56-eecd-478c-b440-0cf4e5c31d61",
       "name": "上线助手",
       "kind": "folder",
+      "path": null,
       "terminalCount": 0
     },
     {
       "id": "folder:9d5ad5ae-bcb1-483e-9d22-290c80b7ce8a",
       "name": "trace追踪助手",
       "kind": "folder",
+      "path": null,
       "terminalCount": 0
     },
     {
       "id": "folder:a151ba26-a0a2-4e84-bf64-fcfe9b155cd0",
       "name": "工单助手",
       "kind": "folder",
+      "path": null,
       "terminalCount": 0
     },
     {
       "id": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
       "name": "小小",
       "kind": "folder",
+      "path": null,
       "terminalCount": 0
     }
   ],
@@ -267,7 +276,7 @@ const real: SessionSnapshot = {
       "pairing": "agent",
       "matchedPid": 8993,
       "matchedPgid": 8993,
-      "processNote": "antigravity 不提供会话 id；本机这种会话 1 个、进程 1 个，1:1 配到 pid 8993（pgid 8993）"
+      "processNote": "antigravity 不提供会话 id；该工作区 1 条会话 / 1 个进程 cwd 一致，1:1 配到 pid 8993（pgid 8993）"
     },
     {
       "workspaceId": "folder:637d87aa-162f-41f8-ba04-b7313fbcd372",
@@ -373,7 +382,7 @@ const real: SessionSnapshot = {
 }
 
 /** One row per screenshot: the same slots, with and without a session id the process answered to. */
-const rowWorkspace = { id: 'folder:1', name: '小小', kind: 'folder' as const, terminalCount: 0 }
+const rowWorkspace = { id: 'folder:1', name: '小小', kind: 'folder' as const, path: null, terminalCount: 0 }
 
 const withId: SessionSnapshot = {
   workspaces: [rowWorkspace],
@@ -420,7 +429,7 @@ const withoutId: SessionSnapshot = {
       pairing: 'agent',
       matchedPid: 8993,
       matchedPgid: 8993,
-      processNote: 'antigravity 不提供会话 id；本机这种会话 1 个、进程 1 个，1:1 配到 pid 8993（pgid 8993）'
+      processNote: 'antigravity 不提供会话 id；该工作区 1 条会话 / 1 个进程 cwd 一致，1:1 配到 pid 8993（pgid 8993）'
     }
   ],
   currentWorkspaceId: 'folder:1',

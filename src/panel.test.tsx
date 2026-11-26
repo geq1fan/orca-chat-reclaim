@@ -70,8 +70,8 @@ function stored(
 
 const snapshot: SessionSnapshot = {
   workspaces: [
-    { id: 'w1', name: '工作区一', kind: 'worktree', terminalCount: 2 },
-    { id: 'w2', name: '工作区二', kind: 'folder', terminalCount: 0 }
+    { id: 'w1', name: '工作区一', kind: 'worktree', path: null, terminalCount: 2 },
+    { id: 'w2', name: '工作区二', kind: 'folder', path: null, terminalCount: 0 }
   ],
   sessions: [
     row({ terminalId: 't1', title: 'Claude 一', state: 'done' }),
@@ -112,7 +112,7 @@ test('groups sessions by workspace and counts the idle ones of the focused works
 test('a done chat with a session id can be closed', async () => {
   const closed: string[] = []
   const chats: SessionSnapshot = {
-    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
       row({
         workspaceId: 'folder:1',
@@ -158,7 +158,7 @@ test('a done chat with a session id can be closed', async () => {
 
 test('a done session with no terminal and no session id cannot be closed', async () => {
   const orphan: SessionSnapshot = {
-    workspaces: [{ id: 'w1', name: '工作区一', kind: 'worktree', terminalCount: 0 }],
+    workspaces: [{ id: 'w1', name: '工作区一', kind: 'worktree', path: null, terminalCount: 0 }],
     sessions: [row({ terminalId: null, sessionId: null, title: '无句柄会话', process: 'stopped' })],
     currentWorkspaceId: 'w1',
     workspacesTruncated: false,
@@ -279,7 +279,7 @@ test('shows the recent operations log', async () => {
 })
 test('a done chat whose ids matched no process is 无法判定 and greyed', async () => {
   const exited: SessionSnapshot = {
-    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
       row({
         workspaceId: 'folder:1',
@@ -308,7 +308,7 @@ test('a done chat whose ids matched no process is 无法判定 and greyed', asyn
 
 test('an id-less pairing shows 无会话 id · pid N, and its note stays in the close tooltip', async () => {
   const idless: SessionSnapshot = {
-    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
       row({
         workspaceId: 'folder:1',
@@ -323,7 +323,7 @@ test('an id-less pairing shows 无会话 id · pid N, and its note stays in the 
         matchedPid: 8993,
         matchedPgid: 8993,
         processNote:
-          'antigravity 不提供会话 id；本机这种会话 1 个、进程 1 个，1:1 配到 pid 8993（pgid 8993）'
+          'antigravity 不提供会话 id；该工作区 1 条会话 / 1 个进程 cwd 一致，1:1 配到 pid 8993（pgid 8993）'
       }),
       row({
         workspaceId: 'folder:1',
@@ -333,7 +333,7 @@ test('an id-less pairing shows 无会话 id · pid N, and its note stays in the 
         title: '会话 1d5698f7',
         sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
         process: 'unknown',
-        processNote: '有 1 个工作区没读到，无法确认本机 claude 的会话总数，不配对'
+        processNote: '会话 id 没有命中任何进程（进程可能已退出，或 ps 里看不到）'
       })
     ],
     currentWorkspaceId: 'folder:1',
@@ -349,7 +349,6 @@ test('an id-less pairing shows 无会话 id · pid N, and its note stays in the 
   assert.ok(view.find({ text: '无会话 id · pid 8993' }))
   // Explanations moved into the close button's tooltip: the row keeps two lines for every agent.
   assert.equal(view.find({ text: /antigravity 不提供会话 id/ }), null)
-  assert.equal(view.find({ text: /无法判定：有 1 个工作区没读到/ }), null)
   assert.ok(
     String(view.find({ role: 'button', text: '关闭' })?.props.tooltip).includes(
       'antigravity 不提供会话 id'
@@ -389,7 +388,7 @@ function rowLeaves(view: TestPanel, title: string): string[] {
 
 test('an id row and an id-less row draw the same fields in the same order', async () => {
   const both: SessionSnapshot = {
-    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
       row({
         workspaceId: 'folder:1',
@@ -415,7 +414,7 @@ test('an id row and an id-less row draw the same fields in the same order', asyn
         matchedPgid: 8993,
         process: 'running',
         processNote:
-          'antigravity 不提供会话 id；本机这种会话 1 个、进程 1 个，1:1 配到 pid 8993（pgid 8993）'
+          'antigravity 不提供会话 id；该工作区 1 条会话 / 1 个进程 cwd 一致，1:1 配到 pid 8993（pgid 8993）'
       })
     ],
     currentWorkspaceId: 'folder:1',
@@ -481,7 +480,7 @@ test('a refused close leaves its reason in the row itself', async () => {
 test('shows the chat title above the session id, truncating a long one', async () => {
   const longTitle = '关闭没反应：进程是 --session-id 启动的，插件只认 --resume 所以要改匹配逻辑'
   const titled: SessionSnapshot = {
-    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
       row({
         workspaceId: 'folder:1',
@@ -519,7 +518,7 @@ test('shows the chat title above the session id, truncating a long one', async (
 
 test('a chat with a live process reads 空闲, and every finished one is reclaimable', async () => {
   const live: SessionSnapshot = {
-    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', terminalCount: 0 }],
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
       row({
         workspaceId: 'folder:1',
@@ -563,7 +562,7 @@ test('a chat with a live process reads 空闲, and every finished one is reclaim
 })
 
 const mixed: SessionSnapshot = {
-  workspaces: [{ id: 'folder:9', name: '小小', kind: 'folder', terminalCount: 0 }],
+  workspaces: [{ id: 'folder:9', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
   sessions: [
     row({
       workspaceId: 'folder:9',
@@ -643,8 +642,8 @@ test('the 显示无进程 switch shows unjudged rows and remembers its state', a
 test('workspaces with only unmatched sessions stay hidden until 显示无进程 is toggled on', async () => {
   const withStoppedGroup: SessionSnapshot = {
     workspaces: [
-      { id: 'w-active', name: '运行工作区', kind: 'worktree', terminalCount: 1 },
-      { id: 'w-stopped', name: '纯休眠工作区', kind: 'folder', terminalCount: 0 }
+      { id: 'w-active', name: '运行工作区', kind: 'worktree', path: null, terminalCount: 1 },
+      { id: 'w-stopped', name: '纯休眠工作区', kind: 'folder', path: null, terminalCount: 0 }
     ],
     sessions: [
       row({ workspaceId: 'w-active', workspaceName: '运行工作区', terminalId: 't1', title: 'Live' }),
@@ -678,7 +677,7 @@ test('workspaces with only unmatched sessions stay hidden until 显示无进程 
 
 test('shows an actionable empty state when all sessions are stopped and hidden', async () => {
   const allStopped: SessionSnapshot = {
-    workspaces: [{ id: 'w-stopped', name: '纯休眠工作区', kind: 'folder', terminalCount: 0 }],
+    workspaces: [{ id: 'w-stopped', name: '纯休眠工作区', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
       row({
         workspaceId: 'w-stopped',

@@ -69,6 +69,7 @@ function processTable(
 }
 
 const AGY = '/Users/me/.local/bin/agy'
+const PI = '/Users/me/.local/bin/pi'
 
 /**
  * The live host's shape for any agent: a wrapper starts the CLI, and the CLI starts a second
@@ -88,7 +89,12 @@ function agentProcessTable(entries: { pid: number; binary: string; args: string 
 }
 
 /** Installs fake process side effects; returns the pgids they were signalled with. */
-function fakeOps(table: string, psError?: string, records: SessionRecord[] = []): number[] {
+function fakeOps(
+  table: string,
+  psError?: string,
+  records: SessionRecord[] = [],
+  cwd: (pid: number) => string | null = () => null
+): number[] {
   const signalled: number[] = []
   let clock = 0
   const ops: SignalOps = {
@@ -97,6 +103,7 @@ function fakeOps(table: string, psError?: string, records: SessionRecord[] = [])
       if (psError) throw new Error(psError)
       return table
     },
+    processCwd: async (pid) => cwd(pid),
     signalGroup: (pgid) => {
       signalled.push(pgid)
     },
@@ -552,11 +559,10 @@ const ANTI = 'b9388fd5-6cae-42ad-9627-0aad35007921'
 const ANTI_ARGS = 'acp --dangerously-skip-permissions'
 
 test('an agent that carries no session id is paired one to one with its only process', async () => {
-  // antigravity: the argv has no --resume=/--session-id=, and its cwd is shared with every other
-  // chat, so neither id nor directory can tell it apart. One session and one process is the
-  // only evidence there is.
+  // antigravity: the argv has no --resume=/--session-id=, so the workspace directory and the
+  // one-session-one-process count are the only evidence there is.
   const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]))
+  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]), undefined, [], () => '/tmp/w1')
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list')
@@ -570,12 +576,12 @@ test('an agent that carries no session id is paired one to one with its only pro
   await worker.deactivate()
 })
 
-test('two sessions and one id-less process are 无法判定, never paired', async () => {
+test('two sessions and one id-less process in the same workspace are 无法判定', async () => {
   const host = hostWith([
     chat(ANTI, { agent: 'antigravity' }),
     chat('7980aac2-0000-4000-8000-000000000000', { agent: 'antigravity' })
   ])
-  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]))
+  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]), undefined, [], () => '/tmp/w1')
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list')
@@ -587,8 +593,89 @@ test('two sessions and one id-less process are 无法判定, never paired', asyn
       ['unknown', null, null]
     ]
   )
-  assert.match(snapshot.sessions[0]?.processNote ?? '', /会话 2 个 \/ 进程 1 个/)
+  assert.match(snapshot.sessions[0]?.processNote ?? '', /该工作区 2 条会话 \/ 1 个进程/)
   assert.match(snapshot.sessions[0]?.processNote ?? '', /不猜/)
+  await worker.deactivate()
+})
+
+test('two sessions and two id-less processes in the same workspace pair one to one', async () => {
+  const host = hostWith([
+    chat(ANTI, { agent: 'antigravity', stateStartedAt: 2000 }),
+    chat('7980aac2-0000-4000-8000-000000000000', { agent: 'antigravity', stateStartedAt: 1000 })
+  ])
+  fakeOps(
+    agentProcessTable([
+      { pid: 8991, binary: AGY, args: ANTI_ARGS },
+      { pid: 8971, binary: AGY, args: ANTI_ARGS }
+    ]),
+    undefined,
+    [],
+    () => '/tmp/w1'
+  )
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  // Deterministic: the older session takes the lower pid, whatever order agents.list used.
+  assert.deepEqual(
+    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedPid]),
+    [
+      ['running', 'agent', 8993],
+      ['running', 'agent', 8973]
+    ]
+  )
+  await worker.deactivate()
+})
+
+test('an id-less session whose process cwd is another workspace is not paired', async () => {
+  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
+  fakeOps(
+    agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]),
+    undefined,
+    [],
+    () => '/tmp/elsewhere'
+  )
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  assert.deepEqual(
+    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedPid]),
+    [['unknown', null, null]]
+  )
+  assert.match(snapshot.sessions[0]?.processNote ?? '', /该工作区 1 条会话 \/ 0 个进程/)
+  await worker.deactivate()
+})
+
+test('pi rows pair by workspace too, even though a pi process carries no id', async () => {
+  // The 小小 case: two pi sessions in one workspace, two pi processes with its cwd. pi used to
+  // count as an id-carrying kind, so these rows were 无法判定 no matter the counts.
+  const PI1 = '01a21695-96fe-76b1-8521-e4ba75d3213d'
+  const PI2 = '12b32695-96fe-76b1-8521-e4ba75d3213d'
+  const host = hostWith([
+    chat(PI1, { agent: 'pi', stateStartedAt: 1000 }),
+    chat(PI2, { agent: 'pi', stateStartedAt: 2000 })
+  ])
+  fakeOps(
+    agentProcessTable([
+      { pid: 80623, binary: PI, args: '--mode rpc' },
+      { pid: 87862, binary: PI, args: '--mode rpc' }
+    ]),
+    undefined,
+    [],
+    () => '/tmp/w1'
+  )
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  assert.deepEqual(
+    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedPid]),
+    [
+      ['running', 'agent', 80625],
+      ['running', 'agent', 87864]
+    ]
+  )
   await worker.deactivate()
 })
 
@@ -598,7 +685,10 @@ test('an agent whose CLI carries an id still matches exactly next to an id-less 
     agentProcessTable([
       { pid: 800, binary: CLAUDE, args: `--resume=${S1}` },
       { pid: 8991, binary: AGY, args: ANTI_ARGS }
-    ])
+    ]),
+    undefined,
+    [],
+    () => '/tmp/w1'
   )
   const worker = await mountWorker(main, { host })
 
@@ -616,7 +706,12 @@ test('an agent whose CLI carries an id still matches exactly next to an id-less 
 
 test('closes a paired id-less session by the pid its kind was paired to', async () => {
   const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  const signalled = fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]))
+  const signalled = fakeOps(
+    agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]),
+    undefined,
+    [],
+    () => '/tmp/w1'
+  )
   const worker = await mountWorker(main, { host })
 
   const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: ANTI, pid: 8993 })
@@ -631,13 +726,42 @@ test('closes a paired id-less session by the pid its kind was paired to', async 
 
 test('a paired close refuses a pid the fresh pairing no longer names', async () => {
   const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  const signalled = fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]))
+  const signalled = fakeOps(
+    agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]),
+    undefined,
+    [],
+    () => '/tmp/w1'
+  )
   const worker = await mountWorker(main, { host })
 
   const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: ANTI, pid: 9000 })
 
   assert.equal(outcome.ok, false)
   assert.equal(outcome.code, 'pairing_changed')
+  assert.deepEqual(signalled, [])
+  await worker.deactivate()
+})
+
+test('a paired close refuses when the process cwd left the workspace before the signal', async () => {
+  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
+  // The snapshot still pairs it (first read: /tmp/w1); the cwd changed before SIGTERM.
+  let reads = 0
+  const signalled = fakeOps(
+    agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]),
+    undefined,
+    [],
+    () => {
+      reads += 1
+      return reads === 1 ? '/tmp/w1' : '/tmp/elsewhere'
+    }
+  )
+  const worker = await mountWorker(main, { host })
+
+  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: ANTI, pid: 8993 })
+
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'cwd_mismatch')
+  assert.match(outcome.message ?? '', /不再等于工作区路径 \/tmp\/w1/)
   assert.deepEqual(signalled, [])
   await worker.deactivate()
 })

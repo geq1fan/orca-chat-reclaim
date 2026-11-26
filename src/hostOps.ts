@@ -95,6 +95,12 @@ export function createSignalOps(): SignalOps {
       return records
     },
     listProcesses: () => run('ps', ['-Ao', 'pid,ppid,pgid,command']),
+    async processCwd(pid) {
+      // `-a` is required: without it lsof ORs `-p` and `-d`, listing every process's cwd.
+      const output = await run('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'])
+      const line = output.split('\n').find((entry) => entry.startsWith('n'))
+      return line && line.length > 1 ? line.slice(1) : null
+    },
     signalGroup: (pgid) => {
       process.kill(-pgid, 'SIGTERM')
     },
