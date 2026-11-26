@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "chat-reclaim",
   "name": "会话资源",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "按工作区列出 agent 会话，逐个或批量关闭空闲（done）会话，补上 Orca 资源面板缺失的关闭按钮。",
   "engines": {
     "orca": ">=1.4.259"
