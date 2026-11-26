@@ -1,21 +1,29 @@
-// The real machine side of stopping a session: the session database, `ps`, and SIGTERM.
+// The real machine side of reading Orca memory/leases/processes and stopping a session.
 // Everything here is macOS-shaped on purpose — the plugin only runs on an Orca desktop host.
 import { execFile } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ChatTitleOps } from './botChats'
-import type { SessionRecord } from './sessionRecord'
-import { chainSessionIds } from './sessionRecord'
-import type { SignalOps } from './sessionProcess'
+import { parseSessionRecordRow, type SessionRecord } from './sessionRecord'
+import { parseMemorySnapshot, type SignalOps } from './sessionProcess'
 
 const DB_PATH = join(homedir(), 'Library', 'Application Support', 'orca', 'agent-session-domain.db')
 
-function run(file: string, args: string[]): Promise<string> {
+function run(
+  file: string,
+  args: string[],
+  options: { env?: Record<string, string | undefined> } = {}
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
-      if (error) reject(error)
-      else resolve(stdout)
-    })
+    execFile(
+      file,
+      args,
+      { maxBuffer: 16 * 1024 * 1024, ...(options.env ? { env: options.env } : {}) },
+      (error, stdout) => {
+        if (error) reject(error)
+        else resolve(stdout)
+      }
+    )
   })
 }
 
@@ -64,42 +72,45 @@ export function createChatTitleOps(): ChatTitleOps {
 export function createSignalOps(): SignalOps {
   return {
     async listSessionRecords() {
-      // One read for the whole snapshot: every stored session's Orca id, the native id it
-      // adopted, and the ids in its handle chain. Only these columns are selected; a record can
-      // be over a megabyte. `adopted_native_id` is a generated column, so the record JSON is never
-      // parsed here.
+      // One read for the whole snapshot: canonical id, adopted native id, provider, location,
+      // conversationName, handle chain, and authoritative lease fields. Only scalar/sub-object
+      // columns are extracted so large transcript blobs inside `record_json` are never returned.
       const output = await run('sqlite3', [
         '-readonly',
         '-json',
         `file:${DB_PATH}?mode=ro`,
         'select session_id, adopted_native_id, ' +
-          "json_extract(record_json,'$.providerHandleChain') as chain from agent_session_records;"
+          "json_extract(record_json,'$.provider') as provider, " +
+          "json_extract(record_json,'$.location.workspaceId') as workspace_id, " +
+          "json_extract(record_json,'$.location.executionHostId') as host_id, " +
+          "json_extract(record_json,'$.conversationName') as conversation_name, " +
+          "json_extract(record_json,'$.providerHandleChain') as chain, " +
+          "json_extract(record_json,'$.lease.claimStatus') as claim_status, " +
+          "json_extract(record_json,'$.lease.unreconciled') as unreconciled, " +
+          "json_extract(record_json,'$.lease.ownerProcess') as owner_process, " +
+          "json_extract(record_json,'$.lease.deathEvidence.kind') as death_kind " +
+          'from agent_session_records;'
       ])
-      const rows = parseJson<{ session_id?: unknown; adopted_native_id?: unknown; chain?: unknown }[]>(
-        output
-      )
+      const rows = parseJson<Record<string, unknown>[]>(output)
       if (!Array.isArray(rows)) return []
       const records: SessionRecord[] = []
       for (const row of rows) {
-        if (typeof row.session_id !== 'string' || row.session_id.length === 0) continue
-        const chain = typeof row.chain === 'string' ? row.chain : null
-        records.push({
-          sessionId: row.session_id,
-          nativeId:
-            typeof row.adopted_native_id === 'string' && row.adopted_native_id.length > 0
-              ? row.adopted_native_id
-              : null,
-          chainIds: chainSessionIds(chain)
-        })
+        if (!row || typeof row !== 'object' || Array.isArray(row)) continue
+        const parsed = parseSessionRecordRow(row)
+        if (parsed) records.push(parsed)
       }
       return records
     },
-    listProcesses: () => run('ps', ['-Ao', 'pid,ppid,pgid,command']),
-    async processCwd(pid) {
-      // `-a` is required: without it lsof ORs `-p` and `-d`, listing every process's cwd.
-      const output = await run('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'])
-      const line = output.split('\n').find((entry) => entry.startsWith('n'))
-      return line && line.length > 1 ? line.slice(1) : null
+    listProcesses: () =>
+      run('ps', ['-Ao', 'pid,ppid,pgid,lstart,command'], {
+        env: { ...process.env, LC_ALL: 'C' }
+      }),
+    async readMemorySnapshot() {
+      try {
+        return parseMemorySnapshot(await runOrca(['diagnostics', 'memory', '--json']))
+      } catch {
+        return null
+      }
     },
     signalGroup: (pgid) => {
       process.kill(-pgid, 'SIGTERM')

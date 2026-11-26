@@ -24,8 +24,11 @@ function row(overrides: Partial<SessionRow>): SessionRow {
     title: 'Claude 一',
     agent: 'claude',
     state: 'done',
+    stateKnown: true,
     stateStartedAt: Date.now() - 60_000,
     sessionId: 'session-t1',
+    orcaSessionId: overrides.sessionId ?? 'session-t1',
+    memoryBytes: null,
     process: null,
     matchedId: null,
     pairing: null,
@@ -88,7 +91,7 @@ const snapshot: SessionSnapshot = {
   currentWorkspaceId: 'w1',
   workspacesTruncated: false,
   failedWorkspaces: 0,
-  recentOps: [],
+  recentOps: []
 }
 
 test('groups sessions by workspace and counts the idle ones of the focused workspace', async () => {
@@ -109,8 +112,8 @@ test('groups sessions by workspace and counts the idle ones of the focused works
   assert.deepEqual(view.errors, [])
 })
 
-test('a done chat with a session id can be closed', async () => {
-  const closed: string[] = []
+test('a done chat with a lease-matched process passes its pid on close', async () => {
+  const closed: { sessionId?: string | null; pid?: number | null }[] = []
   const chats: SessionSnapshot = {
     workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
@@ -121,13 +124,17 @@ test('a done chat with a session id can be closed', async () => {
         terminalId: null,
         title: '会话 39e65ad8',
         sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+        orcaSessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+        pairing: 'lease',
+        matchedPid: 900,
+        matchedPgid: 900,
         process: 'running'
       })
     ],
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
+    recentOps: []
   }
   view = await mount(panel, {
     host: mockHost({
@@ -135,14 +142,14 @@ test('a done chat with a session id can be closed', async () => {
       requests: {
         'sessions.list': () => chats,
         'sessions.close': (input) => {
-          closed.push(input.sessionId ?? '')
+          closed.push({ sessionId: input.sessionId, pid: input.pid })
           return ok(input)
         }
       }
     })
   })
 
-  assert.ok(view.find({ text: '会话 39e65ad8' }))
+  assert.ok(view.find({ text: '会话 39e65ad8 · pid 900' }))
   assert.ok(view.find({ role: 'button', text: '关闭' }))
   assert.equal(view.find({ text: '无法关闭' }), null)
   assert.ok(view.find({ text: /空闲 1 个 · 可回收 1 个/ }))
@@ -151,7 +158,7 @@ test('a done chat with a session id can be closed', async () => {
   assert.deepEqual(closed, [])
   await view.press({ role: 'button', text: '确认关闭' })
 
-  assert.deepEqual(closed, ['39e65ad8-b388-4e57-8d80-e3ad8dc791e8'])
+  assert.deepEqual(closed, [{ sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8', pid: 900 }])
   assert.ok(view.find({ text: '已关闭「会话 39e65ad8」。' }))
   assert.deepEqual(view.errors, [])
 })
@@ -159,11 +166,11 @@ test('a done chat with a session id can be closed', async () => {
 test('a done session with no terminal and no session id cannot be closed', async () => {
   const orphan: SessionSnapshot = {
     workspaces: [{ id: 'w1', name: '工作区一', kind: 'worktree', path: null, terminalCount: 0 }],
-    sessions: [row({ terminalId: null, sessionId: null, title: '无句柄会话', process: 'stopped' })],
+    sessions: [row({ terminalId: null, sessionId: null, orcaSessionId: null, title: '无句柄会话', process: 'stopped' })],
     currentWorkspaceId: 'w1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
+    recentOps: []
   }
   view = await mount(panel, {
     host: mockHost({ storage: stored(['w1'], true), requests: { 'sessions.list': () => orphan } })
@@ -277,7 +284,8 @@ test('shows the recent operations log', async () => {
   assert.ok(view.find({ text: /最近操作 \(1\)/ }))
   assert.deepEqual(view.errors, [])
 })
-test('a done chat whose ids matched no process is 无法判定 and greyed', async () => {
+
+test('a done chat whose process is unknown is greyed and shows its reason in tooltip', async () => {
   const exited: SessionSnapshot = {
     workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
@@ -288,26 +296,29 @@ test('a done chat whose ids matched no process is 无法判定 and greyed', asyn
         terminalId: null,
         title: '会话 1d5698f7',
         sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
-        process: 'unknown'
+        orcaSessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
+        process: 'unknown',
+        processNote: '会话租约状态为 conflicted，无法确认进程状态'
       })
     ],
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
+    recentOps: []
   }
   view = await mount(panel, {
     host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => exited } })
   })
 
-  assert.equal(view.find({ role: 'button', text: '无法判定' })?.disabled, true)
-  assert.ok(view.find({ text: '无法判定' }))
+  const btn = view.find({ role: 'button', text: '无法判定' })
+  assert.equal(btn?.disabled, true)
+  assert.match(String(btn?.props.tooltip), /conflicted/)
   assert.ok(view.find({ text: /可回收 0 个/ }))
   assert.deepEqual(view.errors, [])
 })
 
-test('an id-less pairing shows 无会话 id · pid N, and its note stays in the close tooltip', async () => {
-  const idless: SessionSnapshot = {
+test('a pi row with a .jsonl path never slices /Users/z and formats memoryBytes with canonical orcaSessionId', async () => {
+  const piSnap: SessionSnapshot = {
     workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
       row({
@@ -315,48 +326,75 @@ test('an id-less pairing shows 无会话 id · pid N, and its note stays in the 
         workspaceName: '小小',
         workspaceKind: 'folder',
         terminalId: null,
-        title: '我想开发一个 orca 插件…',
-        agent: 'antigravity',
-        sessionId: 'b9388fd5-6cae-42ad-9627-0aad35007921',
+        title: 'Orca 聊天窗打开 pi 不加载插件解法',
+        agent: 'pi',
+        sessionId: '/Users/zyb/.pi/agent/sessions/--Users-zyb-.orca-bots-bot--/2026-11-26_01a216f3.jsonl',
+        orcaSessionId: '3bfdeb92-fe24-4ebb-8bc2-4a73334cf2e3',
+        memoryBytes: 237373592,
         process: 'running',
-        pairing: 'agent',
-        matchedPid: 8993,
-        matchedPgid: 8993,
-        processNote:
-          'antigravity 不提供会话 id；该工作区 1 条会话 / 1 个进程 cwd 一致，1:1 配到 pid 8993（pgid 8993）'
-      }),
-      row({
-        workspaceId: 'folder:1',
-        workspaceName: '小小',
-        workspaceKind: 'folder',
-        terminalId: null,
-        title: '会话 1d5698f7',
-        sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
-        process: 'unknown',
-        processNote: '会话 id 没有命中任何进程（进程可能已退出，或 ps 里看不到）'
+        pairing: 'lease',
+        matchedPid: 87863,
+        matchedPgid: 87863,
+        processNote: '租约精确匹配 pid 87863（pgid 87863 · startTime 1795681796000）'
       })
     ],
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
+    recentOps: []
   }
   view = await mount(panel, {
-    host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => idless } })
+    host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => piSnap } })
   })
 
-  assert.equal(view.find({ text: '运行中（无会话 id）' }), null)
-  assert.ok(view.find({ text: '无会话 id · pid 8993' }))
-  // Explanations moved into the close button's tooltip: the row keeps two lines for every agent.
-  assert.equal(view.find({ text: /antigravity 不提供会话 id/ }), null)
+  assert.equal(view.find({ text: /\/Users\// }), null)
+  assert.ok(view.find({ text: '会话 3bfdeb92 · 226 MB' }))
   assert.ok(
-    String(view.find({ role: 'button', text: '关闭' })?.props.tooltip).includes(
-      'antigravity 不提供会话 id'
-    )
+    String(view.find({ role: 'button', text: '关闭' })?.props.tooltip).includes('租约精确匹配 pid 87863')
   )
-  // The paired row is closeable; the unjudged one is not.
   assert.equal(view.find({ role: 'button', text: '关闭' })?.disabled, false)
-  assert.equal(view.find({ role: 'button', text: '无法判定' })?.disabled, true)
+  assert.deepEqual(view.errors, [])
+})
+
+test('a stateKnown=false memory-only row disables close with explicit tooltip and stays out of reclaim', async () => {
+  const memOnly: SessionSnapshot = {
+    workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
+    sessions: [
+      row({
+        workspaceId: 'folder:1',
+        workspaceName: '小小',
+        workspaceKind: 'folder',
+        terminalId: null,
+        title: '资源管理器遗漏工作区会话',
+        agent: 'antigravity',
+        state: 'done',
+        stateKnown: false,
+        stateStartedAt: 0,
+        sessionId: 'de053e0e-d00b-4686-bb88-39bea11d4a8f',
+        orcaSessionId: 'de053e0e-d00b-4686-bb88-39bea11d4a8f',
+        memoryBytes: 303012416,
+        process: 'running',
+        pairing: 'lease',
+        matchedPid: 56876,
+        matchedPgid: 56876
+      })
+    ],
+    currentWorkspaceId: 'folder:1',
+    workspacesTruncated: false,
+    failedWorkspaces: 0,
+    recentOps: []
+  }
+  view = await mount(panel, {
+    host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => memOnly } })
+  })
+
+  assert.ok(view.find({ text: '运行中' }))
+  assert.ok(view.find({ text: '状态未知' }))
+  const btn = view.find({ role: 'button', text: '状态未知' })
+  assert.equal(btn?.disabled, true)
+  assert.equal(btn?.props.tooltip, '未从 Orca 获取到会话空闲状态，暂不可关闭')
+  assert.ok(view.find({ text: /空闲 0 个 · 可回收 0 个/ }))
+  assert.equal(view.find({ role: 'button', text: '回收空闲' })?.disabled, true)
   assert.deepEqual(view.errors, [])
 })
 
@@ -386,7 +424,7 @@ function rowLeaves(view: TestPanel, title: string): string[] {
   return found === null ? [] : treeLeaves(found)
 }
 
-test('an id row and an id-less row draw the same fields in the same order', async () => {
+test('a claude row and a pi lease row draw the same fields in the same order', async () => {
   const both: SessionSnapshot = {
     workspaces: [{ id: 'folder:1', name: '小小', kind: 'folder', path: null, terminalCount: 0 }],
     sessions: [
@@ -397,8 +435,12 @@ test('an id row and an id-less row draw the same fields in the same order', asyn
         terminalId: null,
         title: '有 id 的 claude 行',
         sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+        orcaSessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
         matchedId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
-        pairing: 'id',
+        memoryBytes: 583727216,
+        pairing: 'lease',
+        matchedPid: 20822,
+        matchedPgid: 20822,
         process: 'running'
       }),
       row({
@@ -406,15 +448,16 @@ test('an id row and an id-less row draw the same fields in the same order', asyn
         workspaceName: '小小',
         workspaceKind: 'folder',
         terminalId: null,
-        title: '无 id 的 antigravity 行',
-        agent: 'antigravity',
-        sessionId: 'b9388fd5-6cae-42ad-9627-0aad35007921',
-        pairing: 'agent',
-        matchedPid: 8993,
-        matchedPgid: 8993,
+        title: 'pi 的 lease 行',
+        agent: 'pi',
+        sessionId: '/Users/zyb/.pi/agent/sessions/--Users-zyb--/pi.jsonl',
+        orcaSessionId: '3bfdeb92-fe24-4ebb-8bc2-4a73334cf2e3',
+        memoryBytes: 237373592,
+        pairing: 'lease',
+        matchedPid: 87863,
+        matchedPgid: 87863,
         process: 'running',
-        processNote:
-          'antigravity 不提供会话 id；该工作区 1 条会话 / 1 个进程 cwd 一致，1:1 配到 pid 8993（pgid 8993）'
+        processNote: '租约精确匹配 pid 87863（pgid 87863 · startTime 1795681796000）'
       })
     ],
     currentWorkspaceId: 'folder:1',
@@ -426,10 +469,8 @@ test('an id row and an id-less row draw the same fields in the same order', asyn
     host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => both } })
   })
 
-  const withId = rowLeaves(view, '有 id 的 claude 行')
-  const withoutId = rowLeaves(view, '无 id 的 antigravity 行')
-  // Title / badge / agent / · / duration / · / handle / close button: the same slots, in the same
-  // order. A row that explained its 1:1 pairing inline would carry a ninth leaf.
+  const claudeLeaves = rowLeaves(view, '有 id 的 claude 行')
+  const piLeaves = rowLeaves(view, 'pi 的 lease 行')
   const slots = (leaves: string[]): string[] =>
     leaves.map((text, index) => {
       if (index === 0) return 'title'
@@ -440,16 +481,15 @@ test('an id row and an id-less row draw the same fields in the same order', asyn
       if (text === '已空闲' || text === '状态持续') return 'duration'
       return 'handle'
     })
-  assert.equal(withId.length, 8)
-  assert.equal(withoutId.length, 8)
-  assert.deepEqual(slots(withId), slots(withoutId))
-  assert.equal(withId[6], '会话 39e65ad8')
-  assert.equal(withoutId[6], '无会话 id · pid 8993')
-  // The explanation moved into the close button's tooltip, not into another row line.
-  assert.equal(withoutId.some((text) => text.includes('1:1 配到')), false)
+  assert.equal(claudeLeaves.length, 8)
+  assert.equal(piLeaves.length, 8)
+  assert.deepEqual(slots(claudeLeaves), slots(piLeaves))
+  assert.equal(claudeLeaves[6], '会话 39e65ad8 · 557 MB')
+  assert.equal(piLeaves[6], '会话 3bfdeb92 · 226 MB')
+  assert.equal(piLeaves.some((text) => text.includes('租约精确匹配')), false)
   assert.ok(
     String(view.findAll({ role: 'button', text: '关闭' })[1]?.props.tooltip).includes(
-      '1:1 配到 pid 8993'
+      '租约精确匹配 pid 87863'
     )
   )
   assert.deepEqual(view.errors, [])
@@ -471,9 +511,7 @@ test('a refused close leaves its reason in the row itself', async () => {
   await view.press(view.findAll({ role: 'button', text: '关闭' })[0])
   await view.press({ role: 'button', text: '确认关闭' })
 
-  // Exact text match, so this is the row's own line and not the top callout (which adds a code).
   assert.ok(view.find({ text: '关闭失败：没有找到运行中的进程（action_failed）' }))
-  assert.ok(view.find({ text: /关闭失败：没有找到运行中的进程/ }))
   assert.deepEqual(view.errors, [])
 })
 
@@ -489,6 +527,7 @@ test('shows the chat title above the session id, truncating a long one', async (
         terminalId: null,
         title: 'Took over 错题本三期',
         sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+        orcaSessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
         process: 'running'
       }),
       row({
@@ -498,13 +537,14 @@ test('shows the chat title above the session id, truncating a long one', async (
         terminalId: null,
         title: longTitle,
         sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
+        orcaSessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
         process: 'unknown'
       })
     ],
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
+    recentOps: []
   }
   view = await mount(panel, {
     host: mockHost({ storage: stored(['folder:1'], true), requests: { 'sessions.list': () => titled } })
@@ -527,6 +567,7 @@ test('a chat with a live process reads 空闲, and every finished one is reclaim
         terminalId: null,
         title: 'Took over 错题本三期',
         sessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
+        orcaSessionId: '39e65ad8-b388-4e57-8d80-e3ad8dc791e8',
         stateStartedAt: Date.now() - 60_000,
         process: 'running'
       }),
@@ -537,6 +578,7 @@ test('a chat with a live process reads 空闲, and every finished one is reclaim
         terminalId: null,
         title: '每日记忆维护 run 5',
         sessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
+        orcaSessionId: '1d5698f7-3890-4fa9-be15-b096359f32d9',
         stateStartedAt: Date.now() - 3_600_000,
         process: 'running'
       })
@@ -544,13 +586,12 @@ test('a chat with a live process reads 空闲, and every finished one is reclaim
     currentWorkspaceId: 'folder:1',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
+    recentOps: []
   }
   view = await mount(panel, {
     host: mockHost({ storage: stored(['folder:1']), requests: { 'sessions.list': () => live } })
   })
 
-  // Both rows have a live process, so both read 空闲 rather than 已结束, and both can be reclaimed.
   assert.equal(view.findAll({ text: '空闲' }).length >= 2, true)
   assert.ok(view.find({ role: 'button', text: '回收空闲 (2)' }))
 
@@ -571,6 +612,7 @@ const mixed: SessionSnapshot = {
       terminalId: null,
       title: 'Home',
       sessionId: 'home-provider',
+      orcaSessionId: 'home-provider',
       process: 'running'
     }),
     row({
@@ -580,6 +622,7 @@ const mixed: SessionSnapshot = {
       terminalId: null,
       title: '正在跑的另一条',
       sessionId: 'busy-provider',
+      orcaSessionId: 'busy-provider',
       state: 'working',
       process: 'running'
     }),
@@ -590,13 +633,14 @@ const mixed: SessionSnapshot = {
       terminalId: null,
       title: '未运行的那条',
       sessionId: null,
+      orcaSessionId: null,
       process: 'stopped'
     })
   ],
   currentWorkspaceId: 'folder:9',
   workspacesTruncated: false,
   failedWorkspaces: 0,
-  recentOps: [],
+  recentOps: []
 }
 
 test('groups start folded, and unfolding one is remembered', async () => {
@@ -604,7 +648,6 @@ test('groups start folded, and unfolding one is remembered', async () => {
     host: mockHost({ requests: { 'sessions.list': () => mixed } })
   })
 
-  // Folded: no session rows, but the group header still carries the counts.
   assert.equal(view.find({ text: 'Home' }), null)
   assert.ok(view.find({ text: /在运行 2 · 未运行 1/ }))
   assert.ok(view.find({ text: 'Orca 会话 3 条 · 匹配到进程 2 条' }))
@@ -612,13 +655,12 @@ test('groups start folded, and unfolding one is remembered', async () => {
 
   await view.press({ role: 'button', text: '小小' })
   assert.ok(view.find({ text: 'Home' }))
-  // Unfolding does not show the stopped rows; the toggle does.
   assert.equal(view.find({ text: '未运行的那条' }), null)
   assert.deepEqual(view.persisted.storage.expandedGroups, { 'folder:9': true })
   assert.deepEqual(view.errors, [])
 })
 
-test('the 显示无进程 switch shows unjudged rows and remembers its state', async () => {
+test('the 显示无进程 switch shows stopped rows and remembers its state', async () => {
   view = await mount(panel, {
     host: mockHost({
       storage: stored(['folder:9']),
@@ -626,7 +668,6 @@ test('the 显示无进程 switch shows unjudged rows and remembers its state', a
     })
   })
 
-  // The unfolded group is remembered, but stopped rows stay hidden until the switch is on.
   assert.ok(view.find({ text: 'Home' }))
   assert.equal(view.find({ text: '未运行的那条' }), null)
   assert.ok(view.find({ text: /其余 1 条已确认未运行已隐藏/ }))
@@ -653,6 +694,7 @@ test('workspaces with only unmatched sessions stay hidden until 显示无进程 
         workspaceKind: 'folder',
         terminalId: null,
         sessionId: null,
+        orcaSessionId: null,
         title: 'Stopped only',
         process: 'stopped'
       })
@@ -660,7 +702,7 @@ test('workspaces with only unmatched sessions stay hidden until 显示无进程 
     currentWorkspaceId: 'w-active',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
+    recentOps: []
   }
   view = await mount(panel, {
     host: mockHost({ requests: { 'sessions.list': () => withStoppedGroup } })
@@ -685,6 +727,7 @@ test('shows an actionable empty state when all sessions are stopped and hidden',
         workspaceKind: 'folder',
         terminalId: null,
         sessionId: null,
+        orcaSessionId: null,
         title: '休眠会话',
         process: 'stopped'
       })
@@ -692,7 +735,7 @@ test('shows an actionable empty state when all sessions are stopped and hidden',
     currentWorkspaceId: 'w-stopped',
     workspacesTruncated: false,
     failedWorkspaces: 0,
-    recentOps: [],
+    recentOps: []
   }
   view = await mount(panel, {
     host: mockHost({ requests: { 'sessions.list': () => allStopped } })

@@ -45,12 +45,17 @@ test('a record with only an adopted native id still answers that id with its tit
   assert.equal(titles['orca-1'], 'Took over 错题本三期')
 })
 
-test('a title stored under the native id also answers the Orca session id', () => {
-  const titles = aliasTitles({ 'native-1': 'Took over 错题本三期' }, [
+test('a title stored under the native id or chain id also answers the Orca session id', () => {
+  const fromNative = aliasTitles({ 'native-1': 'Took over 错题本三期' }, [
     { sessionId: 'orca-1', nativeId: 'native-1', chainIds: [] }
   ])
+  assert.equal(fromNative['orca-1'], 'Took over 错题本三期')
 
-  assert.equal(titles['orca-1'], 'Took over 错题本三期')
+  const fromChain = aliasTitles({ 'chain-old': '链条历史标题' }, [
+    { sessionId: 'orca-1', nativeId: 'native-1', chainIds: ['chain-old'] }
+  ])
+  assert.equal(fromChain['orca-1'], '链条历史标题')
+  assert.equal(fromChain['native-1'], '链条历史标题')
 })
 
 test('a chain registers nativeId handles as well as sessionId ones', () => {

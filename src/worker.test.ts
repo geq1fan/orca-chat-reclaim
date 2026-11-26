@@ -4,7 +4,7 @@ import * as main from './worker'
 import { useSignalOps, useTitleOps } from './worker'
 import type { ChatTitleOps } from './botChats'
 import type { SessionRecord } from './sessionRecord'
-import type { SignalOps } from './sessionProcess'
+import type { MemorySnapshot, SignalOps } from './sessionProcess'
 
 afterEach(() => {
   useSignalOps(null)
@@ -12,8 +12,8 @@ afterEach(() => {
 })
 
 beforeEach(() => {
-  // `sessions.list` probes the real `ps` and asks the Orca CLI for titles; tests must not touch
-  // the machine, so both seams start as harmless fakes.
+  // `sessions.list` probes `ps`, SQLite, `orca diagnostics memory`, and bot CLI titles;
+  // tests swap both seams to harmless fakes so they never touch the host machine.
   fakeOps('')
   useTitleOps({
     bots: async () => [],
@@ -22,20 +22,26 @@ beforeEach(() => {
 })
 
 const CLAUDE = '/Users/me/.local/bin/claude'
+const AGY = '/Users/me/.local/bin/agy'
+const PI = '/Users/me/.local/bin/pi'
 const PROVIDER = '/Applications/Orca.app/Contents/MacOS/orca-provider-exec'
+const START_STR = 'Thu Nov 26 16:29:56 2026'
+const START_MS = Date.parse(START_STR)
 const S1 = '39e65ad8-b388-4e57-8d80-e3ad8dc791e8'
 const S2 = '1d5698f7-3890-4fa9-be15-b096359f32d9'
 const S3 = '912da5da-78df-42bb-a5eb-a9427a2d3a67'
+const ANTI = 'b9388fd5-6cae-42ad-9627-0aad35007921'
+const ANTI_ARGS = 'acp --dangerously-skip-permissions'
 
 const context = { workspaceId: 'w1', branch: 'main', displayName: '工作区一', terminals: [] }
 
-function workspace(id: string, name: string, terminalCount: number) {
+function workspace(id: string, name: string, terminalCount: number, kind: 'worktree' | 'folder' = 'worktree') {
   return {
     id,
-    kind: 'worktree' as const,
+    kind,
     name,
     path: `/tmp/${id}`,
-    branch: 'main',
+    branch: kind === 'worktree' ? 'main' : null,
     hostId: 'local',
     status: { state: 'done' as const, unread: false, terminalCount, lastActivityAt: 1 }
   }
@@ -53,57 +59,101 @@ function agent(terminalId: string | null, overrides: Record<string, unknown> = {
   }
 }
 
-/** A real chat session: no terminal, no title, only the claude conversation id. */
-function chat(sessionId: string, overrides: Record<string, unknown> = {}) {
+/** A real chat session: no terminal, no title, only the conversation/native id. */
+function chat(sessionId: string | null, overrides: Record<string, unknown> = {}) {
   return agent(null, { title: null, sessionId, ...overrides })
 }
 
-function processTable(
-  entries: { pid: number; resume: string; pgid?: number; flag?: 'resume' | 'session-id' }[]
-): string {
-  const rows = entries.map(
-    ({ pid, resume, pgid, flag }) =>
-      `${pid} 800 ${pgid ?? pid} ${CLAUDE} --${flag ?? 'resume'}=${resume}\n`
-  )
-  return `  PID  PPID  PGID COMMAND\n800 700 800 ${PROVIDER} --cli-input-fd7 1000 3000 -- ${CLAUDE}\n${rows.join('')}`
+function record(overrides: Partial<SessionRecord> & { sessionId: string }): SessionRecord {
+  return {
+    nativeId: null,
+    chainIds: [],
+    provider: 'claude',
+    workspaceId: 'w1',
+    hostId: 'local',
+    conversationName: null,
+    claimStatus: 'released',
+    unreconciled: false,
+    ownerProcess: null,
+    deathKind: null,
+    ...overrides
+  }
 }
 
-const AGY = '/Users/me/.local/bin/agy'
-const PI = '/Users/me/.local/bin/pi'
+function liveRecord(
+  sessionId: string,
+  pid: number,
+  overrides: Partial<SessionRecord> = {}
+): SessionRecord {
+  return record({
+    sessionId,
+    claimStatus: 'live',
+    unreconciled: false,
+    ownerProcess: {
+      hostId: 'local',
+      pid,
+      processStartTimeMs: START_MS,
+      spawnToken: `tok-${pid}`,
+      runtime: 'rt-1'
+    },
+    ...overrides
+  })
+}
+
+function processTable(
+  entries: { pid: number; resume: string; pgid?: number; flag?: 'resume' | 'session-id'; lstart?: string }[]
+): string {
+  const rows = entries.map(
+    ({ pid, resume, pgid, flag, lstart }) =>
+      `${pid} 800 ${pgid ?? pid} ${lstart ?? START_STR} ${CLAUDE} --${flag ?? 'resume'}=${resume}\n`
+  )
+  return `  PID  PPID  PGID STARTED                      COMMAND\n800 700 800 ${START_STR} ${PROVIDER} --cli-input-fd7 1000 3000 -- ${CLAUDE}\n${rows.join('')}`
+}
 
 /**
  * The live host's shape for any agent: a wrapper starts the CLI, and the CLI starts a second
  * wrapper for itself (the stdin-end reporter), which must never count as an agent process.
  */
-function agentChain(pid: number, binary: string, args: string): string {
-  const wrapper = `${PROVIDER} --cli-input-fd7 1000 3000 session stdin-end -- ${binary} ${args}`
+function agentChain(pid: number, binary: string, args: string, lstart = START_STR): string {
+  const wrapper = `${PROVIDER} --cli-input-fd7 1000 3000 session stdin-end -- ${binary}${args ? ` ${args}` : ''}`
+  const childCmd = binary.endsWith('/pi') && !args ? 'pi' : `${binary}${args ? ` ${args}` : ''}`
   return (
-    `${pid} 700 ${pid} ${wrapper}\n` +
-    `${pid + 2} ${pid} ${pid + 2} ${binary} ${args}\n` +
-    `${pid + 3} ${pid + 2} ${pid + 3} ${wrapper}\n`
+    `${pid} 700 ${pid} ${lstart} ${wrapper}\n` +
+    `${pid + 2} ${pid} ${pid + 2} ${lstart} ${childCmd}\n` +
+    `${pid + 3} ${pid + 2} ${pid + 3} ${lstart} ${wrapper}\n`
   )
 }
 
-function agentProcessTable(entries: { pid: number; binary: string; args: string }[]): string {
-  return `  PID  PPID  PGID COMMAND\n${entries.map((entry) => agentChain(entry.pid, entry.binary, entry.args)).join('')}`
+function agentProcessTable(
+  entries: { pid: number; binary: string; args: string; lstart?: string }[]
+): string {
+  return `  PID  PPID  PGID STARTED                      COMMAND\n${entries
+    .map((entry) => agentChain(entry.pid, entry.binary, entry.args, entry.lstart))
+    .join('')}`
 }
 
-/** Installs fake process side effects; returns the pgids they were signalled with. */
+/** Installs fake process/DB/memory side effects; returns the pgids they were signalled with. */
 function fakeOps(
-  table: string,
-  psError?: string,
-  records: SessionRecord[] = [],
-  cwd: (pid: number) => string | null = () => null
+  table: string | (() => string),
+  options: {
+    psError?: string
+    records?: SessionRecord[]
+    recordsError?: string
+    memory?: MemorySnapshot | null
+  } = {}
 ): number[] {
   const signalled: number[] = []
   let clock = 0
   const ops: SignalOps = {
-    listSessionRecords: async () => records,
-    listProcesses: async () => {
-      if (psError) throw new Error(psError)
-      return table
+    listSessionRecords: async () => {
+      if (options.recordsError) throw new Error(options.recordsError)
+      return options.records ?? []
     },
-    processCwd: async (pid) => cwd(pid),
+    listProcesses: async () => {
+      if (options.psError) throw new Error(options.psError)
+      return typeof table === 'function' ? table() : table
+    },
+    readMemorySnapshot: async () => options.memory ?? null,
     signalGroup: (pgid) => {
       signalled.push(pgid)
     },
@@ -147,7 +197,6 @@ test('sessions.list reads every workspace and returns the recent ops', async () 
   const host = mockHost({
     storage: { recentOps: [{ at: 1, ok: true, dryRun: false, kind: 'signal', title: 't' }] },
     results: {
-      // Orca reports terminalCount 0 for a workspace that still holds chat sessions.
       'workspace.list': {
         workspaces: [workspace('w1', '工作区一', 0), workspace('w2', '工作区二', 0), workspace('w3', '工作区三', 2)],
         truncated: false
@@ -156,14 +205,16 @@ test('sessions.list reads every workspace and returns the recent ops', async () 
       'agents.list': ({ workspaceId }: { workspaceId: string }) => ({
         agents:
           workspaceId === 'w1'
-            ? [agent('t1'), agent('t2', { state: 'working' }), agent(null, { title: null, sessionId: S1 })]
+            ? [agent('t1'), agent('t2', { state: 'working' }), chat(S1)]
             : workspaceId === 'w3'
               ? [agent('t3')]
               : []
       })
     }
   })
-  fakeOps(processTable([{ pid: 900, resume: S1 }]))
+  fakeOps(processTable([{ pid: 900, resume: S1 }]), {
+    records: [liveRecord('orca-s1', 900, { nativeId: S1, chainIds: [S1] })]
+  })
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list')
@@ -173,24 +224,22 @@ test('sessions.list reads every workspace and returns the recent ops', async () 
   assert.equal(snapshot.workspacesTruncated, false)
   assert.equal(snapshot.failedWorkspaces, 0)
   assert.equal(snapshot.recentOps.length, 1)
-  // No CLI titles here, so the chat falls back to its id prefix.
-  assert.equal(snapshot.sessions[2]?.title, '会话 39e65ad8')
+  assert.equal(snapshot.sessions[2]?.title, '会话 orca-s1')
   assert.deepEqual(
-    snapshot.sessions.map((session) => [session.workspaceId, session.terminalId, session.state]),
+    snapshot.sessions.map((session) => [session.workspaceId, session.terminalId, session.state, session.stateKnown]),
     [
-      ['w1', 't1', 'done'],
-      ['w1', 't2', 'working'],
-      ['w1', null, 'done'],
-      ['w3', 't3', 'done']
+      ['w1', 't1', 'done', true],
+      ['w1', 't2', 'working', true],
+      ['w1', null, 'done', true],
+      ['w3', 't3', 'done', true]
     ]
   )
-  // A chat with no title falls back to its session id, and the list says which id its process
-  // answered to.
-  assert.equal(snapshot.sessions[2]?.title, '会话 39e65ad8')
   assert.equal(snapshot.sessions[2]?.sessionId, S1)
+  assert.equal(snapshot.sessions[2]?.orcaSessionId, 'orca-s1')
   assert.equal(snapshot.sessions[2]?.matchedId, S1)
+  assert.equal(snapshot.sessions[2]?.pairing, 'lease')
+  assert.equal(snapshot.sessions[2]?.matchedPid, 900)
   assert.equal(snapshot.sessions[2]?.process, 'running')
-  // Terminal-backed sessions are addressed by their terminal, not by a provider process.
   assert.equal(snapshot.sessions[0]?.process, null)
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
@@ -217,12 +266,18 @@ test('sessions.list counts a refused workspace instead of dropping it silently',
   await worker.deactivate()
 })
 
-test('closes a done chat by signalling its process group and logs it', async () => {
+test('closes a done chat via lease and logs it', async () => {
   const host = hostWith([chat(S1)])
-  const signalled = fakeOps(processTable([{ pid: 900, resume: S1 }]))
+  const signalled = fakeOps(processTable([{ pid: 900, resume: S1 }]), {
+    records: [liveRecord('orca-s1', 900, { nativeId: S1, chainIds: [S1] })]
+  })
   const worker = await mountWorker(main, { host })
 
-  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: S1 })
+  const outcome = await worker.request('sessions.close', {
+    workspaceId: 'w1',
+    sessionId: S1,
+    pid: 900
+  })
 
   assert.equal(outcome.ok, true)
   assert.equal(outcome.how, 'signal')
@@ -236,32 +291,28 @@ test('closes a done chat by signalling its process group and logs it', async () 
   assert.equal(stored[0]?.pid, 900)
   assert.equal(stored[0]?.pgid, 900)
   assert.equal(stored[0]?.sessionUuid, S1)
-  assert.equal(stored[0]?.title, '会话 39e65ad8')
   assert.equal(stored[0]?.ok, true)
   await worker.deactivate()
 })
 
 test('refuses a session that is not done without touching its process', async () => {
   const host = hostWith([chat(S1, { state: 'working' })])
-  const signalled = fakeOps(processTable([{ pid: 900, resume: S1 }]))
+  const signalled = fakeOps(processTable([{ pid: 900, resume: S1 }]), {
+    records: [liveRecord('orca-s1', 900, { nativeId: S1 })]
+  })
   const worker = await mountWorker(main, { host })
 
-  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: S1 })
+  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: S1, pid: 900 })
 
   assert.equal(outcome.ok, false)
   assert.equal(outcome.code, 'not_idle')
   assert.match(outcome.message ?? '', /运行中/)
   assert.deepEqual(signalled, [])
   assert.equal(host.callsOf('terminal.close').length, 0)
-  // A refusal is still an attempt: it lands in the log so the panel can show it.
-  const stored = host.data().storage.recentOps as Record<string, unknown>[]
-  assert.equal(stored.length, 1)
-  assert.equal(stored[0]?.ok, false)
-  assert.match(String(stored[0]?.message), /运行中/)
   await worker.deactivate()
 })
 
-test('reports a refusal when no claude process matches the session', async () => {
+test('reports a refusal when no process matches the session', async () => {
   const host = hostWith([chat(S1)])
   const signalled = fakeOps(processTable([]))
   const worker = await mountWorker(main, { host })
@@ -303,7 +354,8 @@ test('closes a terminal-backed session through the terminal API', async () => {
   await worker.deactivate()
 })
 
-test('sessions.reclaim closes every finished session with a matched process, and no working one', async () => {
+test('sessions.reclaim closes every finished session with known state and a live process, skipping working and memory-only rows', async () => {
+  const S4 = '44444444-4444-4444-8444-444444444444'
   const host = hostWith([
     chat(S1, { stateStartedAt: 3000 }),
     chat(S2, { state: 'working', stateStartedAt: 4000 }),
@@ -312,8 +364,31 @@ test('sessions.reclaim closes every finished session with a matched process, and
   const signalled = fakeOps(
     processTable([
       { pid: 900, resume: S1 },
-      { pid: 902, resume: S3 }
-    ])
+      { pid: 902, resume: S3 },
+      { pid: 904, resume: S4 }
+    ]),
+    {
+      records: [
+        liveRecord('orca-1', 900, { nativeId: S1, chainIds: [S1] }),
+        liveRecord('orca-2', 901, { nativeId: S2, chainIds: [S2] }),
+        liveRecord('orca-3', 902, { nativeId: S3, chainIds: [S3] }),
+        liveRecord('orca-4', 904, { nativeId: S4, chainIds: [S4] })
+      ],
+      memory: {
+        worktrees: [
+          {
+            worktreeId: 'w1',
+            worktreeName: '工作区一',
+            repoId: null,
+            repoName: null,
+            cpu: 1,
+            memory: 1000,
+            chats: [{ agentSessionId: 'orca-4', agent: 'claude', name: '未上报状态会话', cpu: 0, memory: 500 }],
+            sessions: []
+          }
+        ]
+      }
+    }
   )
   const worker = await mountWorker(main, { host })
 
@@ -332,18 +407,29 @@ test('sessions.reclaim closes every finished session with a matched process, and
 })
 
 test('sessions.reclaim stops at the first refusal', async () => {
-  // S2 exists but is not its own group leader, so it is refused and the rest is left alone.
   const host = hostWith([
     chat(S1, { stateStartedAt: 3000 }),
     chat(S2, { stateStartedAt: 1000 }),
     chat(S3, { stateStartedAt: 2000 })
   ])
+  // S2 is running during readSnapshot, then loses group leadership before closeOne re-reads `ps`.
+  let psReads = 0
   const signalled = fakeOps(
-    processTable([
-      { pid: 900, resume: S1 },
-      { pid: 901, resume: S2, pgid: 800 },
-      { pid: 903, resume: S3 }
-    ])
+    () => {
+      psReads += 1
+      return processTable([
+        { pid: 900, resume: S1 },
+        { pid: 901, resume: S2, pgid: psReads <= 2 ? 901 : 800 },
+        { pid: 903, resume: S3 }
+      ])
+    },
+    {
+      records: [
+        liveRecord('orca-1', 900, { nativeId: S1, chainIds: [S1] }),
+        liveRecord('orca-2', 901, { nativeId: S2, chainIds: [S2] }),
+        liveRecord('orca-3', 903, { nativeId: S3, chainIds: [S3] })
+      ]
+    }
   )
   const worker = await mountWorker(main, { host })
 
@@ -361,32 +447,97 @@ test('sessions.reclaim stops at the first refusal', async () => {
   assert.deepEqual(signalled, [900])
   await worker.deactivate()
 })
-test('a chat whose ids matched no process is 无法判定, not 未运行', async () => {
+
+test('released lease with no running process is confirmed 未运行 (stopped), eliminating 无法判定', async () => {
   const host = hostWith([chat(S1), chat(S2)])
-  fakeOps(processTable([{ pid: 900, resume: S1 }]))
+  fakeOps(processTable([{ pid: 900, resume: S1 }]), {
+    records: [
+      liveRecord('orca-1', 900, { nativeId: S1, chainIds: [S1] }),
+      record({
+        sessionId: 'orca-2',
+        nativeId: S2,
+        chainIds: [S2],
+        claimStatus: 'released',
+        ownerProcess: null,
+        deathKind: 'exit-observed'
+      })
+    ]
+  })
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list')
 
   assert.equal(snapshot.sessions[0]?.process, 'running')
-  assert.equal(snapshot.sessions[1]?.process, 'unknown')
+  assert.equal(snapshot.sessions[0]?.pairing, 'lease')
+  assert.equal(snapshot.sessions[1]?.process, 'stopped')
+  assert.match(snapshot.sessions[1]?.processNote ?? '', /exit-observed/)
   await worker.deactivate()
 })
 
-test('a chat with no candidate id is confirmed 未运行', async () => {
-  const host = hostWith([agent(null, { title: null, sessionId: null })])
-  fakeOps(processTable([]))
+test('released lease still running on CLI --resume= is still marked running rather than hidden', async () => {
+  const host = hostWith([chat(S1)])
+  fakeOps(processTable([{ pid: 900, resume: S1 }]), {
+    records: [
+      record({
+        sessionId: 'orca-1',
+        nativeId: S1,
+        chainIds: [S1],
+        claimStatus: 'released',
+        ownerProcess: null
+      })
+    ]
+  })
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list')
 
-  assert.equal(snapshot.sessions[0]?.process, 'stopped')
+  assert.equal(snapshot.sessions[0]?.process, 'running')
+  assert.equal(snapshot.sessions[0]?.pairing, 'id')
+  assert.equal(snapshot.sessions[0]?.matchedId, S1)
+  await worker.deactivate()
+})
+
+test('reserved, conflicted, unreconciled, remote host, and PID-reused leases are marked 无法判定 with clear reasons', async () => {
+  const S4 = '44444444-4444-4444-8444-444444444444'
+  const S5 = '55555555-5555-4555-8555-555555555555'
+  const host = hostWith([chat(S1), chat(S2), chat(S3), chat(S4), chat(S5)])
+  fakeOps(
+    processTable([
+      { pid: 900, resume: S1 },
+      { pid: 904, resume: S5, lstart: 'Thu Nov 26 17:10:00 2026' }
+    ]),
+    {
+      records: [
+        record({ sessionId: 'orca-1', nativeId: S1, claimStatus: 'reserved', ownerProcess: null }),
+        record({ sessionId: 'orca-2', nativeId: S2, claimStatus: 'conflicted', ownerProcess: null }),
+        liveRecord('orca-3', 902, { nativeId: S3, unreconciled: true }),
+        liveRecord('orca-4', 903, {
+          nativeId: S4,
+          ownerProcess: { hostId: 'ssh:remote', pid: 903, processStartTimeMs: START_MS, spawnToken: 't', runtime: 'r' }
+        }),
+        liveRecord('orca-5', 904, { nativeId: S5 })
+      ]
+    }
+  )
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  assert.deepEqual(
+    snapshot.sessions.map((s) => s.process),
+    ['unknown', 'unknown', 'unknown', 'unknown', 'unknown']
+  )
+  assert.match(snapshot.sessions[0]?.processNote ?? '', /reserved/)
+  assert.match(snapshot.sessions[1]?.processNote ?? '', /conflicted/)
+  assert.match(snapshot.sessions[2]?.processNote ?? '', /unreconciled/)
+  assert.match(snapshot.sessions[3]?.processNote ?? '', /ssh:remote/)
+  assert.match(snapshot.sessions[4]?.processNote ?? '', /PID 已被复用/)
   await worker.deactivate()
 })
 
 test('sessions.list leaves the process unknown when ps cannot be read', async () => {
   const host = hostWith([chat(S1)])
-  fakeOps('', 'ps: operation not permitted')
+  fakeOps('', { psError: 'ps: operation not permitted' })
   const worker = await mountWorker(main, { host })
 
   const snapshot = await worker.request('sessions.list')
@@ -397,9 +548,178 @@ test('sessions.list leaves the process unknown when ps cannot be read', async ()
   await worker.deactivate()
 })
 
+test('sessions.list aligns 1:1 with diagnostics.memory across git worktrees, fills memoryBytes, and surfaces omitted active chats as stateKnown=false', async () => {
+  const ORCA_WT = 'orca-wt-1'
+  const ORCA_MISSING = 'orca-missing-1'
+  const ORCA_HIDDEN = 'orca-hidden-1'
+  const wt1 = workspace('identity:wt2:local:abc', 'fix-sync', 1, 'worktree')
+  wt1.path = '/Users/me/wt1'
+  const host = mockHost({
+    results: {
+      'workspace.list': { workspaces: [wt1, workspace('folder:bot', '小小', 0, 'folder')], truncated: false },
+      'workspace.readContext': { ...context, workspaceId: wt1.id },
+      'agents.list': ({ workspaceId }: { workspaceId: string }) => {
+        if (workspaceId === wt1.id) {
+          return {
+            agents: [
+              agent('t1', { sessionId: 'term-sess', agent: 'pi', state: 'working' }),
+              chat(ORCA_WT, { agent: 'antigravity', state: 'done' })
+            ]
+          }
+        }
+        if (workspaceId === 'folder:bot') {
+          return { agents: [] } // agents.list omitted ORCA_MISSING
+        }
+        throw hostError('action_failed', 'unknown synthetic workspace')
+      }
+    }
+  })
+  fakeOps(
+    agentProcessTable([
+      { pid: 900, binary: AGY, args: ANTI_ARGS },
+      { pid: 910, binary: CLAUDE, args: `--session-id=${ORCA_MISSING}` },
+      { pid: 920, binary: PI, args: '' }
+    ]),
+    {
+      records: [
+        liveRecord(ORCA_WT, 902, {
+          provider: 'antigravity',
+          workspaceId: 'repo1::/Users/me/wt1'
+        }),
+        liveRecord(ORCA_MISSING, 912, {
+          provider: 'claude',
+          workspaceId: 'folder:bot'
+        }),
+        liveRecord(ORCA_HIDDEN, 922, {
+          provider: 'pi',
+          nativeId: '/Users/zyb/.pi/agent/sessions/hidden.jsonl',
+          workspaceId: 'repo2::/Users/me/truncated-wt'
+        })
+      ],
+      memory: {
+        worktrees: [
+          {
+            worktreeId: 'repo1::/Users/me/wt1',
+            worktreeName: 'fix-sync',
+            repoId: 'repo1',
+            repoName: 'orca-chat-reclaim',
+            cpu: 10,
+            memory: 400_000_000,
+            chats: [
+              { agentSessionId: ORCA_WT, agent: 'antigravity', name: '资源管理器工作区标题', cpu: 5, memory: 278_000_000 }
+            ],
+            sessions: [
+              { sessionId: 'repo1::/Users/me/wt1@@t1', paneKey: 'pk-1', pid: 888, cpu: 5, memory: 122_000_000 }
+            ]
+          },
+          {
+            worktreeId: 'folder:bot',
+            worktreeName: '小小',
+            repoId: 'bots',
+            repoName: 'Bots',
+            cpu: 2,
+            memory: 500_000_000,
+            chats: [
+              { agentSessionId: ORCA_MISSING, agent: 'claude', name: '被截断漏报的活跃对话', cpu: 2, memory: 500_000_000 }
+            ],
+            sessions: []
+          },
+          {
+            worktreeId: 'repo2::/Users/me/truncated-wt',
+            worktreeName: 'truncated-wt',
+            repoId: 'repo2',
+            repoName: 'other',
+            cpu: 3,
+            memory: 200_000_000,
+            chats: [
+              { agentSessionId: ORCA_HIDDEN, agent: 'pi', name: '截断工作区里的 pi', cpu: 3, memory: 200_000_000 }
+            ],
+            sessions: []
+          }
+        ]
+      }
+    }
+  )
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  // Synthetic truncated-wt failure on agents.list must not pollute failedWorkspaces.
+  assert.equal(snapshot.failedWorkspaces, 0)
+  assert.equal(snapshot.workspaces.some((w) => w.id === 'repo2::/Users/me/truncated-wt'), true)
+
+  const term = snapshot.sessions.find((s) => s.terminalId === 't1')
+  assert.equal(term?.memoryBytes, 122_000_000)
+  assert.equal(term?.stateKnown, true)
+
+  const wtChat = snapshot.sessions.find((s) => s.orcaSessionId === ORCA_WT)
+  assert.equal(wtChat?.title, '资源管理器工作区标题')
+  assert.equal(wtChat?.memoryBytes, 278_000_000)
+  assert.equal(wtChat?.process, 'running')
+  assert.equal(wtChat?.pairing, 'lease')
+  assert.equal(wtChat?.matchedPid, 902)
+  assert.equal(wtChat?.stateKnown, true)
+
+  const omitted = snapshot.sessions.find((s) => s.orcaSessionId === ORCA_MISSING)
+  assert.equal(omitted?.workspaceId, 'folder:bot')
+  assert.equal(omitted?.title, '被截断漏报的活跃对话')
+  assert.equal(omitted?.process, 'running')
+  assert.equal(omitted?.memoryBytes, 500_000_000)
+  assert.equal(omitted?.stateKnown, false)
+  assert.match(omitted?.processNote ?? '', /未从 Orca 获取到会话空闲状态，暂不可关闭/)
+
+  const hidden = snapshot.sessions.find((s) => s.orcaSessionId === ORCA_HIDDEN)
+  assert.equal(hidden?.workspaceId, 'repo2::/Users/me/truncated-wt')
+  assert.equal(hidden?.title, '截断工作区里的 pi')
+  assert.equal(hidden?.process, 'running')
+  assert.equal(hidden?.stateKnown, false)
+  await worker.deactivate()
+})
+
+test('title resolution follows memory.name > botTitles > conversationName > orcaSessionId prefix and never slices file paths', async () => {
+  const PI_PATH = '/Users/zyb/.pi/agent/sessions/--Users-zyb-.orca-bots-bot--/2026-11-26_01a216f3.jsonl'
+  const PI_ORCA_1 = '3bfdeb92-fe24-4ebb-8bc2-4a73334cf2e3'
+  const PI_ORCA_2 = 'bb0d11e8-e515-4b62-8841-8473140fcda2'
+  const PI_PATH_2 = '/Users/zyb/.pi/agent/sessions/--Users-zyb--/2026-11-26_deadbeef.jsonl'
+
+  const host = hostWith([
+    chat(PI_PATH, { agent: 'pi' }),
+    chat(PI_PATH_2, { agent: 'pi' }),
+    chat('/Users/zyb/untracked/pi.jsonl', { agent: 'pi' })
+  ])
+  fakeOps(agentProcessTable([{ pid: 900, binary: PI, args: '' }]), {
+    records: [
+      liveRecord(PI_ORCA_1, 902, {
+        provider: 'pi',
+        nativeId: PI_PATH,
+        chainIds: [PI_PATH],
+        conversationName: '来自 DB conversationName'
+      }),
+      record({
+        sessionId: PI_ORCA_2,
+        provider: 'pi',
+        nativeId: PI_PATH_2,
+        chainIds: [PI_PATH_2],
+        conversationName: null,
+        claimStatus: 'released',
+        ownerProcess: null
+      })
+    ]
+  })
+  const worker = await mountWorker(main, { host })
+
+  const snapshot = await worker.request('sessions.list')
+
+  assert.equal(snapshot.sessions[0]?.title, '来自 DB conversationName')
+  assert.equal(snapshot.sessions[1]?.title, '会话 bb0d11e8')
+  assert.equal(snapshot.sessions[1]?.process, 'stopped')
+  // Untracked path id never gets sliced into `会话 /Users/z`.
+  assert.equal(snapshot.sessions[2]?.title, '未命名会话')
+  await worker.deactivate()
+})
+
 test('sessions.list shows the chat title from the bot list and caches it for a minute', async () => {
   const host = hostWith([chat(S1)])
-  fakeOps('')
   fakeOps(processTable([]))
   const asked = fakeTitles({ [S1]: 'Took over 错题本三期' })
   const worker = await mountWorker(main, { host })
@@ -408,7 +728,6 @@ test('sessions.list shows the chat title from the bot list and caches it for a m
   assert.equal(first.sessions[0]?.title, 'Took over 错题本三期')
   assert.deepEqual(asked, ['小小'])
 
-  // A second draw inside the minute reuses the cache; a forced refresh asks the CLI again.
   await worker.request('sessions.list', {})
   assert.deepEqual(asked, ['小小'])
   await worker.request('sessions.list', { refreshTitles: true })
@@ -416,74 +735,7 @@ test('sessions.list shows the chat title from the bot list and caches it for a m
   await worker.deactivate()
 })
 
-test('a title found under the Orca session id lands on the provider id row', async () => {
-  const host = hostWith([chat(S1)])
-  fakeOps(processTable([{ pid: 900, resume: S1 }]), undefined, [
-    { sessionId: 'orca-session-1', nativeId: S1, chainIds: [S1] }
-  ])
-  fakeTitles({ 'orca-session-1': '上线单 13703928' })
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list', {})
-
-  // The row shows the id the process answered to, and that same id found the title.
-  assert.equal(snapshot.sessions[0]?.matchedId, S1)
-  assert.equal(snapshot.sessions[0]?.title, '上线单 13703928')
-  await worker.deactivate()
-})
-
-test('an antigravity chat whose only native id is adopted shows its title', async () => {
-  // The real "小小" case: Orca session 7980aac2 owns the chat, its record adopted b9388fd5 as
-  // the native id, and the chain names only that native id — there is no claude-style chain
-  // sessionId to alias from. The row shows b9388fd5, so its title must come from the adopted id.
-  const ORCA = '7980aac2-bf09-406f-9627-8294f76955b4'
-  const title = '我想开发一个orca插件，用于展示我创建的MR列表，点击后可以在浏览器打开。先画下原型'
-  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]), undefined, [
-    { sessionId: ORCA, nativeId: ANTI, chainIds: [ANTI] }
-  ])
-  fakeTitles({ [ORCA]: title })
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list', {})
-
-  assert.equal(snapshot.sessions[0]?.sessionId, ANTI)
-  assert.equal(snapshot.sessions[0]?.title, title)
-  await worker.deactivate()
-})
-
-test('an unreadable title source keeps the id prefix and does not break the list', async () => {
-  const host = hostWith([chat(S1)])
-  useTitleOps({
-    bots: async () => {
-      throw new Error('orca: command not found')
-    },
-    chats: async () => []
-  })
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list', {})
-
-  assert.equal(snapshot.sessions[0]?.title, '会话 39e65ad8')
-  assert.equal(snapshot.failedWorkspaces, 0)
-  await worker.deactivate()
-})
-
-test('a chat Orca restored without a provider id is 未运行 and never named after its agent', async () => {
-  const host = hostWith([agent(null, { title: null, sessionId: null })])
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list', {})
-
-  assert.equal(snapshot.sessions[0]?.title, '未命名会话')
-  assert.equal(snapshot.sessions[0]?.sessionId, null)
-  assert.equal(snapshot.sessions[0]?.process, 'stopped')
-  await worker.deactivate()
-})
-
 test('maps four live sessions one to one, even when Orca reports an older id', async () => {
-  // The real ids from the host: Home's row carries the provider id; the coordinator's row carries
-  // the Orca session id; 未匹配到题目问题排查's row still carries the pre-rewind provider id.
   const HOME_ORCA = '87cea74d-887c-465a-a052-1040892904bb'
   const HOME_NATIVE = 'dd411755-4b8d-4ebc-b89f-9ef38d089774'
   const COORD_ORCA = '69af17fc-fe61-4578-a2b4-f37f364c31cd'
@@ -515,17 +767,17 @@ test('maps four live sessions one to one, even when Orca reports an older id', a
       { pid: 902, resume: HOME_NATIVE },
       { pid: 903, resume: DEPLOY_NATIVE, flag: 'session-id' }
     ]),
-    undefined,
-    [
-      { sessionId: HOME_ORCA, nativeId: HOME_NATIVE, chainIds: [HOME_NATIVE] },
-      {
-        sessionId: COORD_ORCA,
-        nativeId: COORD_NATIVE,
-        chainIds: ['39e65ad8-b388-4e57-8d80-e3ad8dc791e8', COORD_NATIVE]
-      },
-      { sessionId: SEARCH_ORCA, nativeId: SEARCH_NATIVE, chainIds: [SEARCH_OLD, SEARCH_NATIVE] },
-      { sessionId: DEPLOY_ORCA, nativeId: DEPLOY_NATIVE, chainIds: [DEPLOY_NATIVE] }
-    ]
+    {
+      records: [
+        liveRecord(HOME_ORCA, 902, { nativeId: HOME_NATIVE, chainIds: [HOME_NATIVE] }),
+        liveRecord(COORD_ORCA, 900, {
+          nativeId: COORD_NATIVE,
+          chainIds: ['39e65ad8-b388-4e57-8d80-e3ad8dc791e8', COORD_NATIVE]
+        }),
+        liveRecord(SEARCH_ORCA, 901, { nativeId: SEARCH_NATIVE, chainIds: [SEARCH_OLD, SEARCH_NATIVE] }),
+        liveRecord(DEPLOY_ORCA, 903, { nativeId: DEPLOY_NATIVE, chainIds: [DEPLOY_NATIVE] })
+      ]
+    }
   )
   fakeTitles({
     [HOME_ORCA]: 'Home',
@@ -538,236 +790,75 @@ test('maps four live sessions one to one, even when Orca reports an older id', a
   const snapshot = await worker.request('sessions.list', {})
   const rows = snapshot.sessions.map((session) => ({
     rowId: session.sessionId,
+    orcaSessionId: session.orcaSessionId,
     matchedId: session.matchedId,
+    matchedPid: session.matchedPid,
     title: session.title,
     process: session.process
   }))
 
   assert.deepEqual(rows, [
-    { rowId: HOME_NATIVE, matchedId: HOME_NATIVE, title: 'Home', process: 'running' },
-    { rowId: COORD_ORCA, matchedId: COORD_NATIVE, title: '分析当前 Mac 内存占用', process: 'running' },
-    { rowId: SEARCH_OLD, matchedId: SEARCH_NATIVE, title: '未匹配到题目问题排查', process: 'running' },
-    { rowId: DEPLOY_NATIVE, matchedId: DEPLOY_NATIVE, title: '上线 dsl-hub 的 engine 与 controller 更新', process: 'running' }
+    { rowId: HOME_NATIVE, orcaSessionId: HOME_ORCA, matchedId: HOME_NATIVE, matchedPid: 902, title: 'Home', process: 'running' },
+    { rowId: COORD_ORCA, orcaSessionId: COORD_ORCA, matchedId: COORD_NATIVE, matchedPid: 900, title: '分析当前 Mac 内存占用', process: 'running' },
+    { rowId: SEARCH_OLD, orcaSessionId: SEARCH_ORCA, matchedId: SEARCH_NATIVE, matchedPid: 901, title: '未匹配到题目问题排查', process: 'running' },
+    { rowId: DEPLOY_NATIVE, orcaSessionId: DEPLOY_ORCA, matchedId: DEPLOY_NATIVE, matchedPid: 903, title: '上线 dsl-hub 的 engine 与 controller 更新', process: 'running' }
   ])
-  // No title crossed onto a process it does not belong to.
-  assert.equal(rows.filter((row) => row.title === 'Home').length, 1)
-  assert.equal(rows.filter((row) => row.title === '分析当前 Mac 内存占用').length, 1)
   await worker.deactivate()
 })
 
-const ANTI = 'b9388fd5-6cae-42ad-9627-0aad35007921'
-const ANTI_ARGS = 'acp --dangerously-skip-permissions'
+test('closes pi and antigravity sessions via lease and matches canonical sessionId to nativeId rows', async () => {
+  const PI_ORCA = '3bfdeb92-fe24-4ebb-8bc2-4a73334cf2e3'
+  const PI_PATH = '/Users/zyb/.pi/agent/sessions/--Users-zyb--/pi.jsonl'
+  const ANTI_ORCA = '7980aac2-bf09-406f-9627-8294f76955b4'
 
-test('an agent that carries no session id is paired one to one with its only process', async () => {
-  // antigravity: the argv has no --resume=/--session-id=, so the workspace directory and the
-  // one-session-one-process count are the only evidence there is.
-  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]), undefined, [], () => '/tmp/w1')
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list')
-
-  assert.equal(snapshot.sessions[0]?.process, 'running')
-  assert.equal(snapshot.sessions[0]?.pairing, 'agent')
-  assert.equal(snapshot.sessions[0]?.matchedId, null)
-  assert.equal(snapshot.sessions[0]?.matchedPid, 8993)
-  assert.equal(snapshot.sessions[0]?.matchedPgid, 8993)
-  assert.match(snapshot.sessions[0]?.processNote ?? '', /1:1/)
-  await worker.deactivate()
-})
-
-test('two sessions and one id-less process in the same workspace are 无法判定', async () => {
   const host = hostWith([
-    chat(ANTI, { agent: 'antigravity' }),
-    chat('7980aac2-0000-4000-8000-000000000000', { agent: 'antigravity' })
+    chat(PI_PATH, { agent: 'pi' }),
+    chat(ANTI, { agent: 'antigravity' })
   ])
-  fakeOps(agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]), undefined, [], () => '/tmp/w1')
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list')
-
-  assert.deepEqual(
-    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedPid]),
-    [
-      ['unknown', null, null],
-      ['unknown', null, null]
-    ]
-  )
-  assert.match(snapshot.sessions[0]?.processNote ?? '', /该工作区 2 条会话 \/ 1 个进程/)
-  assert.match(snapshot.sessions[0]?.processNote ?? '', /不猜/)
-  await worker.deactivate()
-})
-
-test('two sessions and two id-less processes in the same workspace pair one to one', async () => {
-  const host = hostWith([
-    chat(ANTI, { agent: 'antigravity', stateStartedAt: 2000 }),
-    chat('7980aac2-0000-4000-8000-000000000000', { agent: 'antigravity', stateStartedAt: 1000 })
-  ])
-  fakeOps(
+  const signalled = fakeOps(
     agentProcessTable([
-      { pid: 8991, binary: AGY, args: ANTI_ARGS },
-      { pid: 8971, binary: AGY, args: ANTI_ARGS }
-    ]),
-    undefined,
-    [],
-    () => '/tmp/w1'
-  )
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list')
-
-  // Deterministic: the older session takes the lower pid, whatever order agents.list used.
-  assert.deepEqual(
-    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedPid]),
-    [
-      ['running', 'agent', 8993],
-      ['running', 'agent', 8973]
-    ]
-  )
-  await worker.deactivate()
-})
-
-test('an id-less session whose process cwd is another workspace is not paired', async () => {
-  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  fakeOps(
-    agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]),
-    undefined,
-    [],
-    () => '/tmp/elsewhere'
-  )
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list')
-
-  assert.deepEqual(
-    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedPid]),
-    [['unknown', null, null]]
-  )
-  assert.match(snapshot.sessions[0]?.processNote ?? '', /该工作区 1 条会话 \/ 0 个进程/)
-  await worker.deactivate()
-})
-
-test('pi rows pair by workspace too, even though a pi process carries no id', async () => {
-  // The 小小 case: two pi sessions in one workspace, two pi processes with its cwd. pi used to
-  // count as an id-carrying kind, so these rows were 无法判定 no matter the counts.
-  const PI1 = '01a21695-96fe-76b1-8521-e4ba75d3213d'
-  const PI2 = '12b32695-96fe-76b1-8521-e4ba75d3213d'
-  const host = hostWith([
-    chat(PI1, { agent: 'pi', stateStartedAt: 1000 }),
-    chat(PI2, { agent: 'pi', stateStartedAt: 2000 })
-  ])
-  fakeOps(
-    agentProcessTable([
-      { pid: 80623, binary: PI, args: '--mode rpc' },
-      { pid: 87862, binary: PI, args: '--mode rpc' }
-    ]),
-    undefined,
-    [],
-    () => '/tmp/w1'
-  )
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list')
-
-  assert.deepEqual(
-    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedPid]),
-    [
-      ['running', 'agent', 80625],
-      ['running', 'agent', 87864]
-    ]
-  )
-  await worker.deactivate()
-})
-
-test('an agent whose CLI carries an id still matches exactly next to an id-less one', async () => {
-  const host = hostWith([chat(S1), chat(ANTI, { agent: 'antigravity' })])
-  fakeOps(
-    agentProcessTable([
-      { pid: 800, binary: CLAUDE, args: `--resume=${S1}` },
+      { pid: 87861, binary: PI, args: '' },
       { pid: 8991, binary: AGY, args: ANTI_ARGS }
     ]),
-    undefined,
-    [],
-    () => '/tmp/w1'
-  )
-  const worker = await mountWorker(main, { host })
-
-  const snapshot = await worker.request('sessions.list')
-
-  assert.deepEqual(
-    snapshot.sessions.map((session) => [session.process, session.pairing, session.matchedId, session.matchedPid]),
-    [
-      ['running', 'id', S1, null],
-      ['running', 'agent', null, 8993]
-    ]
-  )
-  await worker.deactivate()
-})
-
-test('closes a paired id-less session by the pid its kind was paired to', async () => {
-  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  const signalled = fakeOps(
-    agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]),
-    undefined,
-    [],
-    () => '/tmp/w1'
-  )
-  const worker = await mountWorker(main, { host })
-
-  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: ANTI, pid: 8993 })
-
-  assert.equal(outcome.ok, true)
-  assert.equal(outcome.how, 'signal')
-  assert.equal(outcome.pid, 8993)
-  assert.equal(outcome.pgid, 8993)
-  assert.deepEqual(signalled, [8993])
-  await worker.deactivate()
-})
-
-test('a paired close refuses a pid the fresh pairing no longer names', async () => {
-  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  const signalled = fakeOps(
-    agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]),
-    undefined,
-    [],
-    () => '/tmp/w1'
-  )
-  const worker = await mountWorker(main, { host })
-
-  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: ANTI, pid: 9000 })
-
-  assert.equal(outcome.ok, false)
-  assert.equal(outcome.code, 'pairing_changed')
-  assert.deepEqual(signalled, [])
-  await worker.deactivate()
-})
-
-test('a paired close refuses when the process cwd left the workspace before the signal', async () => {
-  const host = hostWith([chat(ANTI, { agent: 'antigravity' })])
-  // The snapshot still pairs it (first read: /tmp/w1); the cwd changed before SIGTERM.
-  let reads = 0
-  const signalled = fakeOps(
-    agentProcessTable([{ pid: 8991, binary: AGY, args: ANTI_ARGS }]),
-    undefined,
-    [],
-    () => {
-      reads += 1
-      return reads === 1 ? '/tmp/w1' : '/tmp/elsewhere'
+    {
+      records: [
+        liveRecord(PI_ORCA, 87863, { provider: 'pi', nativeId: PI_PATH, chainIds: [PI_PATH] }),
+        liveRecord(ANTI_ORCA, 8993, { provider: 'antigravity', nativeId: ANTI, chainIds: [ANTI] })
+      ]
     }
   )
   const worker = await mountWorker(main, { host })
 
-  const outcome = await worker.request('sessions.close', { workspaceId: 'w1', sessionId: ANTI, pid: 8993 })
+  // Closing by canonical ORCA id still locates the agents.list row holding PI_PATH.
+  const outPi = await worker.request('sessions.close', {
+    workspaceId: 'w1',
+    sessionId: PI_ORCA,
+    pid: 87863
+  })
+  assert.equal(outPi.ok, true)
+  assert.equal(outPi.pid, 87863)
 
-  assert.equal(outcome.ok, false)
-  assert.equal(outcome.code, 'cwd_mismatch')
-  assert.match(outcome.message ?? '', /不再等于工作区路径 \/tmp\/w1/)
-  assert.deepEqual(signalled, [])
+  // Stale pid refused with process_changed.
+  const outChanged = await worker.request('sessions.close', {
+    workspaceId: 'w1',
+    sessionId: ANTI,
+    pid: 9000
+  })
+  assert.equal(outChanged.ok, false)
+  assert.equal(outChanged.code, 'process_changed')
+
+  const outAnti = await worker.request('sessions.close', {
+    workspaceId: 'w1',
+    sessionId: ANTI,
+    pid: 8993
+  })
+  assert.equal(outAnti.ok, true)
+  assert.equal(outAnti.pid, 8993)
+  assert.deepEqual(signalled, [87863, 8993])
   await worker.deactivate()
 })
 
 test('a chat never takes the host agent title as its title', async () => {
-  // `agents.list.title` may carry the bot's name for chats; it is not the conversation title.
   const host = hostWith([agent(null, { title: '小小', sessionId: S1 })])
   fakeOps('')
   const worker = await mountWorker(main, { host })

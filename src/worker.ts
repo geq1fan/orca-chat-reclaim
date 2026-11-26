@@ -1,11 +1,11 @@
-// The plugin's own worker: it reads Orca's host API, and stops a session either through the
-// terminal API or, for a chat session with no terminal, by SIGTERM-ing the claude process group
-// that Orca started for it. Nothing is killed without resolving the process first.
+// The plugin's own worker: aligns active sessions with `orca diagnostics memory` (the Resource
+// Manager source), resolves chat processes authoritatively via `agent_session_records.lease` +
+// `ps lstart` anti-PID-reuse verification, and closes sessions via terminal API or SIGTERM.
 import type { OrcaWorkerApi } from 'orca/worker'
 import { buildTitleMap, type ChatTitleOps } from './botChats'
 import { messageOf } from './errors'
 import { createChatTitleOps, createSignalOps } from './hostOps'
-import { AGENT_STATE_LABEL } from './labels'
+import { AGENT_STATE_LABEL, isFilePath } from './labels'
 import type {
   AgentState,
   CloseOutcome,
@@ -17,14 +17,27 @@ import type {
   WorkspaceRow
 } from './protocol'
 import {
-  agentProcesses,
+  findAgentTargetByLease,
   findRunningProcessId,
   parseProcessTable,
-  providesSessionId,
+  parseProviderId,
   type PsRow
 } from './processTable'
-import { aliasTitles, sessionCandidates, type SessionRecord } from './sessionRecord'
-import { stopPairedSession, stopSessionWithSignal, type SignalOps } from './sessionProcess'
+import {
+  aliasTitles,
+  extractWorktreePath,
+  findSessionRecord,
+  sessionCandidates,
+  type SessionRecord,
+  type SessionRecordLookup
+} from './sessionRecord'
+import {
+  stopSessionByLease,
+  type MemoryChat,
+  type MemoryTerminalSession,
+  type MemoryWorktree,
+  type SignalOps
+} from './sessionProcess'
 import { selectIdle } from './sessions'
 
 /** How many `agents.list` calls are in flight at once. 127 workspaces one by one is slow. */
@@ -110,7 +123,12 @@ async function loadTitles(orca: OrcaWorkerApi, refresh: boolean): Promise<Record
   return fresh
 }
 
-/** Terminal panes carry their own title; a chat's title comes only from the chat-title table. */
+function safeIdLabel(id: string | null): string {
+  if (id && !isFilePath(id)) return `会话 ${id.slice(0, 8)}`
+  return '未命名会话'
+}
+
+/** Terminal panes carry their own title; a chat's title comes from Resource Manager / CLI / DB. */
 function terminalLabel(agent: {
   title?: string | null
   task?: { title: string } | null
@@ -118,12 +136,7 @@ function terminalLabel(agent: {
 }): string {
   if (agent.title) return agent.title
   if (agent.task?.title) return agent.task.title
-  if (agent.sessionId) return `会话 ${agent.sessionId.slice(0, 8)}`
-  return '未命名会话'
-}
-
-function idLabel(id: string | null): string {
-  return id ? `会话 ${id.slice(0, 8)}` : '未命名会话'
+  return safeIdLabel(agent.sessionId ?? null)
 }
 
 async function readOps(orca: OrcaWorkerApi): Promise<OpRecord[]> {
@@ -153,29 +166,310 @@ type ListedAgent = {
   stateStartedAt: number
 }
 
-/** A chat session matched to a process without ever seeing its id. */
-type KindPairing = {
-  pid: number
-  pgid: number
-  /** The workspace's session count, equal to its cwd-matching process count — the basis. */
-  count: number
+/**
+ * Matches a worktree entry from `orca diagnostics memory` (`folder:<uuid>` or `<repoId>::/abs/path`)
+ * to a `WorkspaceRow` from `workspace.list` (`folder:<uuid>` or `identity:wt2:local:<uuid>` + `path`).
+ */
+export function resolveMemoryWorkspace(
+  memWt: Pick<MemoryWorktree, 'worktreeId' | 'worktreeName'>,
+  workspaces: readonly WorkspaceRow[]
+): WorkspaceRow | null {
+  const exact = workspaces.find((workspace) => workspace.id === memWt.worktreeId)
+  if (exact) return exact
+  const memPath = extractWorktreePath(memWt.worktreeId)
+  if (!memPath) return null
+  const byPath = workspaces.filter((workspace) => workspace.path === memPath)
+  if (byPath.length === 0) return null
+  if (byPath.length === 1) return byPath[0]
+  const worktreesOnly = byPath.filter((workspace) => workspace.kind === 'worktree')
+  const pool = worktreesOnly.length > 0 ? worktreesOnly : byPath
+  if (pool.length === 1) return pool[0]
+  const byName = pool.find(
+    (workspace) =>
+      workspace.name === memWt.worktreeName || memWt.worktreeName.endsWith(`:${workspace.name}`)
+  )
+  return byName ?? pool[0]
 }
 
-/** Reads every workspace and the agent sessions inside them. */
+type ChatProcessResolution = {
+  process: ProcessState
+  matchedId: string | null
+  pairing: 'lease' | 'id' | null
+  matchedPid: number | null
+  matchedPgid: number | null
+  processNote: string | null
+}
+
+function resolveChatProcess(options: {
+  kind: string
+  rowId: string | null
+  candidates: readonly string[]
+  recordLookup: SessionRecordLookup
+  recordsLoaded: boolean
+  recordsError: string | null
+  processTable: readonly PsRow[] | null
+  psError: string | null
+  ownPgid: number | null
+  inMemorySnapshot: boolean
+}): ChatProcessResolution {
+  const {
+    kind,
+    rowId,
+    candidates,
+    recordLookup,
+    recordsLoaded,
+    recordsError,
+    processTable,
+    psError,
+    ownPgid,
+    inMemorySnapshot
+  } = options
+
+  if (processTable === null) {
+    return {
+      process: 'unknown',
+      matchedId: null,
+      pairing: null,
+      matchedPid: null,
+      matchedPgid: null,
+      processNote: `ps 读不到：${psError ?? '未知错误'}`
+    }
+  }
+
+  if (recordLookup.status === 'ambiguous') {
+    return {
+      process: 'unknown',
+      matchedId: null,
+      pairing: null,
+      matchedPid: null,
+      matchedPgid: null,
+      processNote: `会话数据库里 ${rowId ?? '当前会话'} 命中 ${recordLookup.records.length} 条记录，无法唯一判定`
+    }
+  }
+
+  if (recordLookup.status === 'found') {
+    const { record } = recordLookup
+    if (record.unreconciled) {
+      return {
+        process: 'unknown',
+        matchedId: null,
+        pairing: null,
+        matchedPid: null,
+        matchedPgid: null,
+        processNote: '会话租约处于未对账状态（unreconciled），等待 Orca 对账'
+      }
+    }
+
+    if (record.claimStatus === 'live' && record.ownerProcess !== null) {
+      const expectedKind = kind !== 'unknown' ? kind : record.provider
+      const leaseTarget = findAgentTargetByLease(processTable, record.ownerProcess, expectedKind, ownPgid)
+      if (leaseTarget.ok) {
+        const cliId = parseProviderId(leaseTarget.target.command)
+        const startNote =
+          leaseTarget.target.startTimeMs !== null ? ` · startTime ${leaseTarget.target.startTimeMs}` : ''
+        return {
+          process: 'running',
+          matchedId: cliId,
+          pairing: 'lease',
+          matchedPid: leaseTarget.target.pid,
+          matchedPgid: leaseTarget.target.pgid,
+          processNote: `租约精确匹配 pid ${leaseTarget.target.pid}（pgid ${leaseTarget.target.pgid}${startNote}）`
+        }
+      }
+      return {
+        process: 'unknown',
+        matchedId: null,
+        pairing: null,
+        matchedPid: null,
+        matchedPgid: null,
+        processNote: leaseTarget.message
+      }
+    }
+
+    if (record.claimStatus === 'released' && record.ownerProcess === null) {
+      const runningId = findRunningProcessId(processTable, candidates)
+      if (runningId) {
+        return {
+          process: 'running',
+          matchedId: runningId,
+          pairing: 'id',
+          matchedPid: null,
+          matchedPgid: null,
+          processNote: `租约标记 released，但 ps 检测到命令行 id ${runningId} 仍在运行`
+        }
+      }
+      if (inMemorySnapshot) {
+        return {
+          process: 'unknown',
+          matchedId: null,
+          pairing: null,
+          matchedPid: null,
+          matchedPgid: null,
+          processNote: '会话仍在 Orca 资源管理器中，但租约已标记 released，无法判定进程归属'
+        }
+      }
+      return {
+        process: 'stopped',
+        matchedId: null,
+        pairing: null,
+        matchedPid: null,
+        matchedPgid: null,
+        processNote: record.deathKind ? `租约已释放（${record.deathKind}），确认未运行` : '租约已释放，确认未运行'
+      }
+    }
+
+    if (record.claimStatus === null && record.ownerProcess === null) {
+      const runningId = findRunningProcessId(processTable, candidates)
+      if (runningId) {
+        return {
+          process: 'running',
+          matchedId: runningId,
+          pairing: 'id',
+          matchedPid: null,
+          matchedPgid: null,
+          processNote: null
+        }
+      }
+      if (candidates.length === 0 && !inMemorySnapshot) {
+        return {
+          process: 'stopped',
+          matchedId: null,
+          pairing: null,
+          matchedPid: null,
+          matchedPgid: null,
+          processNote: null
+        }
+      }
+      return {
+        process: 'unknown',
+        matchedId: null,
+        pairing: null,
+        matchedPid: null,
+        matchedPgid: null,
+        processNote: '会话缺少租约字段且未匹配到命令行进程'
+      }
+    }
+
+    return {
+      process: 'unknown',
+      matchedId: null,
+      pairing: null,
+      matchedPid: null,
+      matchedPgid: null,
+      processNote: `会话租约状态为 ${record.claimStatus ?? '未知'}${record.ownerProcess ? '' : '（缺少 ownerProcess）'}，无法确认进程状态`
+    }
+  }
+
+  // Fallback when DB is unreadable or has no record for this row.
+  const runningId = findRunningProcessId(processTable, candidates)
+  if (runningId) {
+    return {
+      process: 'running',
+      matchedId: runningId,
+      pairing: 'id',
+      matchedPid: null,
+      matchedPgid: null,
+      processNote: null
+    }
+  }
+  if (candidates.length === 0 && !inMemorySnapshot) {
+    return {
+      process: 'stopped',
+      matchedId: null,
+      pairing: null,
+      matchedPid: null,
+      matchedPgid: null,
+      processNote: null
+    }
+  }
+  const dbHint = !recordsLoaded
+    ? `（读会话数据库失败：${recordsError ?? '未知错误'}）`
+    : '（会话数据库无此记录）'
+  return {
+    process: 'unknown',
+    matchedId: null,
+    pairing: null,
+    matchedPid: null,
+    matchedPgid: null,
+    processNote: `没有匹配到进程${dbHint}`
+  }
+}
+
+/**
+ * Chat title resolution priority:
+ * 1. `diagnostics.memory` `chat.name` (identical to Resource Manager),
+ * 2. `orca bot chats` title table (via canonical/matched/native/chain aliases),
+ * 3. `agent_session_records.conversationName`,
+ * 4. `会话 <orcaSessionId 前 8 位>` (or non-path `matchedId` / `rowId`),
+ * 5. `未命名会话` (never slices filesystem paths such as pi's `.jsonl` path).
+ */
+function resolveChatTitle(options: {
+  memoryName: string | null
+  titles: Record<string, string>
+  record: SessionRecord | null
+  orcaSessionId: string | null
+  matchedId: string | null
+  rowId: string | null
+}): string {
+  const { memoryName, titles, record, orcaSessionId, matchedId, rowId } = options
+  const memTrimmed = memoryName?.trim() ?? ''
+  if (memTrimmed.length > 0) return memTrimmed
+
+  const titleKeys = [
+    orcaSessionId,
+    matchedId,
+    rowId,
+    record?.sessionId ?? null,
+    record?.nativeId ?? null,
+    ...(record?.chainIds ?? [])
+  ]
+  for (const key of titleKeys) {
+    if (key && titles[key]) return titles[key]
+  }
+
+  const convName = record?.conversationName?.trim() ?? ''
+  if (convName.length > 0) return convName
+
+  for (const id of [orcaSessionId, matchedId, rowId]) {
+    if (id && !isFilePath(id)) return `会话 ${id.slice(0, 8)}`
+  }
+  return '未命名会话'
+}
+
+function matchTerminalMemory(
+  agent: ListedAgent,
+  memSessions: readonly MemoryTerminalSession[] | undefined,
+  workspaceTerminalTotal: number
+): number | null {
+  if (!memSessions || memSessions.length === 0) return null
+  const direct = memSessions.find(
+    (session) =>
+      session.sessionId === agent.sessionId ||
+      session.sessionId === agent.terminalId ||
+      session.paneKey === agent.terminalId ||
+      session.paneKey === agent.sessionId
+  )
+  if (direct) return direct.memory
+  if (memSessions.length === 1 && workspaceTerminalTotal === 1) return memSessions[0].memory
+  return null
+}
+
+/** Reads every workspace, merges `orca diagnostics memory`, and resolves processes via leases. */
 async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promise<SessionSnapshot> {
   const listed = await orca.host.call('workspace.list', { includeStatus: true })
   const context = await orca.host.call('workspace.readContext')
 
-  // One read of the session database and one `ps` for the whole list. The database tells a row
-  // every id its process may carry; `ps` says which of them is actually running. Either source
-  // failing leaves the rows it would have answered for unjudged, never "not running".
   let records: SessionRecord[] = []
+  let recordsLoaded = false
+  let recordsError: string | null = null
   try {
     records = await signalOperations().listSessionRecords()
-  } catch {
-    // Without the chain a row can still match on the id it carries; nothing else is claimed.
+    recordsLoaded = true
+  } catch (error) {
     records = []
+    recordsError = messageOf(error)
   }
+
   let processTable: PsRow[] | null = null
   let psError: string | null = null
   try {
@@ -185,185 +479,241 @@ async function readSnapshot(orca: OrcaWorkerApi, refreshTitles: boolean): Promis
     psError = messageOf(error)
   }
 
-  const titles = aliasTitles(await loadTitles(orca, refreshTitles), records)
+  const [memorySnapshot, ownPgid, rawTitles] = await Promise.all([
+    signalOperations()
+      .readMemorySnapshot()
+      .catch(() => null),
+    signalOperations()
+      .ownPgid()
+      .catch(() => null),
+    loadTitles(orca, refreshTitles)
+  ])
+  const titles = aliasTitles(rawTitles, records)
 
-  const workspaces = listed.workspaces.map((workspace) => ({
+  const workspaces: WorkspaceRow[] = listed.workspaces.map((workspace) => ({
     id: workspace.id,
     name: workspace.name,
     kind: workspace.kind,
     path: workspace.path || null,
     terminalCount: workspace.status?.terminalCount ?? null
   }))
-  const workspacePaths = new Map(workspaces.map((workspace) => [workspace.id, workspace.path]))
+  const syntheticWorkspaceIds = new Set<string>()
+  const memoryChatsById = new Map<string, { chat: MemoryChat; workspace: WorkspaceRow }>()
+  const memoryTerminalsByWorkspace = new Map<string, MemoryTerminalSession[]>()
 
-  const scanned: { workspace: WorkspaceRow; agent: ListedAgent }[] = []
+  if (memorySnapshot) {
+    for (const memWt of memorySnapshot.worktrees) {
+      let resolved = resolveMemoryWorkspace(memWt, workspaces)
+      if (!resolved && (memWt.chats.length > 0 || memWt.sessions.length > 0)) {
+        resolved = {
+          id: memWt.worktreeId,
+          name: memWt.worktreeName || memWt.worktreeId,
+          kind: memWt.worktreeId.startsWith('folder:') ? 'folder' : 'worktree',
+          path: extractWorktreePath(memWt.worktreeId),
+          terminalCount: memWt.sessions.length
+        }
+        workspaces.push(resolved)
+        syntheticWorkspaceIds.add(resolved.id)
+      }
+      if (!resolved) continue
+      for (const chat of memWt.chats) {
+        memoryChatsById.set(chat.agentSessionId, { chat, workspace: resolved })
+      }
+      if (memWt.sessions.length > 0) {
+        const existing = memoryTerminalsByWorkspace.get(resolved.id)
+        if (existing) existing.push(...memWt.sessions)
+        else memoryTerminalsByWorkspace.set(resolved.id, [...memWt.sessions])
+      }
+    }
+  }
+
+  const scanned: { workspace: WorkspaceRow; agent: ListedAgent; workspaceTerminalTotal: number }[] = []
   let failedWorkspaces = 0
 
-  for (let start = 0; start < listed.workspaces.length; start += BATCH) {
-    const batch = listed.workspaces.slice(start, start + BATCH)
+  for (let start = 0; start < workspaces.length; start += BATCH) {
+    const batch = workspaces.slice(start, start + BATCH)
     const answers = await Promise.all(
       batch.map(async (workspace) => {
         try {
           const { agents } = await orca.host.call('agents.list', { workspaceId: workspace.id })
           return { workspace, agents }
         } catch {
-          // A workspace that vanished mid-scan must not cost the whole list, but the panel says
-          // how many were skipped instead of quietly showing fewer sessions.
           return { workspace, agents: null }
         }
       })
     )
     for (const { workspace, agents } of answers) {
       if (agents === null) {
-        failedWorkspaces += 1
+        if (!syntheticWorkspaceIds.has(workspace.id)) failedWorkspaces += 1
         continue
       }
+      const terminalTotal = agents.filter((agent) => agent.terminalId !== null).length
       for (const agent of agents) {
-        scanned.push({
-          workspace: {
-            id: workspace.id,
-            name: workspace.name,
-            kind: workspace.kind,
-            path: workspace.path || null,
-            terminalCount: workspace.status?.terminalCount ?? null
-          },
-          agent
-        })
+        scanned.push({ workspace, agent, workspaceTerminalTotal: terminalTotal })
       }
     }
   }
 
-  const processes = processTable ? agentProcesses(processTable) : []
-
-  // Exact matches first: an agent whose CLI carries a conversation id is reached by that id.
-  const candidatesAt = new Map<number, string[]>()
-  const matchedAt = new Map<number, string>()
-  scanned.forEach((entry, index) => {
-    if (entry.agent.terminalId !== null || processTable === null) return
-    const candidates = sessionCandidates(records, entry.agent.sessionId ?? null)
-    candidatesAt.set(index, candidates)
-    const matchedId = findRunningProcessId(processTable, candidates)
-    if (matchedId) matchedAt.set(index, matchedId)
-  })
-
-  // Ids that matched nothing may belong to an agent kind that never puts an id on its command
-  // line. Pair them inside their own workspace: only processes whose cwd is that workspace
-  // directory count, and only an exact per-workspace 1:1 count is evidence. Any other count is
-  // left unjudged — the machine-wide counts are not comparable, because other workspaces run the
-  // same kind too.
-  const pending = new Map<string, { workspaceId: string; kind: string; indexes: number[] }>()
-  scanned.forEach((entry, index) => {
-    if (entry.agent.terminalId !== null || processTable === null || matchedAt.has(index)) return
-    const kind = entry.agent.agent ?? 'unknown'
-    if (providesSessionId(kind, processes)) return
-    const key = `${entry.workspace.id}\u0000${kind}`
-    const group = pending.get(key)
-    if (group) group.indexes.push(index)
-    else pending.set(key, { workspaceId: entry.workspace.id, kind, indexes: [index] })
-  })
-
-  // One `lsof` per pid, shared by every workspace: a pid can only have one cwd.
-  const cwdCache = new Map<number, string | null>()
-  const cwdOf = async (pid: number): Promise<string | null> => {
-    if (!cwdCache.has(pid)) {
-      cwdCache.set(pid, await signalOperations().processCwd(pid).catch(() => null))
-    }
-    return cwdCache.get(pid) ?? null
-  }
-
-  const pairs = new Map<number, KindPairing>()
-  const pairingNotes = new Map<number, string>()
-  for (const { workspaceId, kind, indexes } of pending.values()) {
-    const workspacePath = workspacePaths.get(workspaceId) ?? null
-    if (!workspacePath) {
-      const note = `${kind} 不提供会话 id；读不到工作区 ${workspaceId} 的目录路径，无法按目录配对`
-      for (const index of indexes) pairingNotes.set(index, note)
-      continue
-    }
-    const kindProcesses = processes
-      .filter((process) => process.kind === kind && process.providerId === null)
-      .sort((left, right) => left.row.pid - right.row.pid)
-    const inWorkspace = []
-    for (const process of kindProcesses) {
-      if ((await cwdOf(process.row.pid)) === workspacePath) inWorkspace.push(process)
-    }
-    if (inWorkspace.length !== indexes.length) {
-      const note = `${kind} 不提供会话 id；该工作区 ${indexes.length} 条会话 / ${inWorkspace.length} 个进程，数量不等，不猜`
-      for (const index of indexes) pairingNotes.set(index, note)
-      continue
-    }
-    // Deterministic order, so the same machine state always yields the same pairings.
-    const ordered = [...indexes].sort((left, right) => {
-      const leftSession = scanned[left]
-      const rightSession = scanned[right]
-      const byStart = leftSession.agent.stateStartedAt - rightSession.agent.stateStartedAt
-      if (byStart !== 0) return byStart
-      return (leftSession.agent.sessionId ?? '').localeCompare(rightSession.agent.sessionId ?? '')
-    })
-    for (let position = 0; position < ordered.length; position += 1) {
-      const index = ordered[position]
-      const process = inWorkspace[position]
-      if (index === undefined || !process) continue
-      pairs.set(index, { pid: process.row.pid, pgid: process.row.pgid, count: ordered.length })
-    }
-  }
-
-  const sessions: SessionRow[] = scanned.map(({ workspace, agent }, index) => {
+  const seenCanonicalChatIds = new Set<string>()
+  const sessions: SessionRow[] = scanned.map(({ workspace, agent, workspaceTerminalTotal }) => {
     const rowId = agent.sessionId ?? null
-    const candidates = candidatesAt.get(index) ?? []
-    const matchedId = matchedAt.get(index) ?? null
-    const pair = pairs.get(index) ?? null
-    const kind = agent.agent ?? 'unknown'
+    const recordLookup = recordsLoaded
+      ? findSessionRecord(records, rowId, workspace.id, workspace.path)
+      : ({ status: 'not_found' } as const)
+    const record = recordLookup.status === 'found' ? recordLookup.record : null
 
-    let process: ProcessState | null
-    let processNote: string | null = null
     if (agent.terminalId !== null) {
-      process = null
-    } else if (processTable === null) {
-      process = 'unknown'
-      processNote = `ps 读不到：${psError ?? '未知错误'}`
-    } else if (matchedId) {
-      process = 'running'
-    } else if (pair) {
-      process = 'running'
-      processNote = `${kind} 不提供会话 id；该工作区 ${pair.count} 条会话 / ${pair.count} 个进程 cwd 一致，1:1 配到 pid ${pair.pid}（pgid ${pair.pgid}）`
-    } else if (candidates.length === 0) {
-      // No id any process could carry, and no pairing to stand on: nothing here to run.
-      process = 'stopped'
-    } else {
-      // Ids exist but none matched, or the id-less pairing refused: unjudged, never "not running".
-      process = 'unknown'
-      processNote =
-        pairingNotes.get(index) ?? '会话 id 没有命中任何进程（进程可能已退出，或 ps 里看不到）'
+      const memoryBytes = matchTerminalMemory(
+        agent,
+        memoryTerminalsByWorkspace.get(workspace.id),
+        workspaceTerminalTotal
+      )
+      return {
+        workspaceId: workspace.id,
+        workspaceName: workspace.name,
+        workspaceKind: workspace.kind,
+        terminalId: agent.terminalId,
+        title: terminalLabel(agent),
+        agent: agent.agent ?? 'unknown',
+        state: agent.state,
+        stateKnown: true,
+        stateStartedAt: agent.stateStartedAt,
+        sessionId: rowId,
+        orcaSessionId: record?.sessionId ?? null,
+        memoryBytes,
+        process: null,
+        matchedId: null,
+        pairing: null,
+        matchedPid: null,
+        matchedPgid: null,
+        processNote: null
+      }
     }
 
-    // The row shows the id its process answered to, and looks the title up by that same id.
-    const displayId = agent.terminalId !== null ? rowId ?? agent.terminalId : matchedId ?? rowId
-    const title =
-      agent.terminalId !== null
-        ? terminalLabel(agent)
-        : displayId
-          ? (titles[displayId] ?? idLabel(displayId))
-          : '未命名会话'
+    const canonicalId =
+      record?.sessionId ?? (rowId && memoryChatsById.has(rowId) ? rowId : null)
+    if (canonicalId) seenCanonicalChatIds.add(canonicalId)
+
+    const memEntry =
+      (canonicalId ? memoryChatsById.get(canonicalId) : undefined) ??
+      (rowId ? memoryChatsById.get(rowId) : undefined) ??
+      null
+    if (memEntry) seenCanonicalChatIds.add(memEntry.chat.agentSessionId)
+
+    const kind =
+      agent.agent && agent.agent.length > 0
+        ? agent.agent
+        : memEntry?.chat.agent || record?.provider || 'unknown'
+    const candidates = recordsLoaded
+      ? sessionCandidates(records, rowId, workspace.id, workspace.path)
+      : rowId
+        ? [rowId]
+        : []
+    const resolvedProcess = resolveChatProcess({
+      kind,
+      rowId,
+      candidates,
+      recordLookup,
+      recordsLoaded,
+      recordsError,
+      processTable,
+      psError,
+      ownPgid,
+      inMemorySnapshot: memEntry !== null
+    })
+
+    const orcaSessionId =
+      canonicalId ?? (rowId && !isFilePath(rowId) ? rowId : null)
+    const title = resolveChatTitle({
+      memoryName: memEntry?.chat.name ?? null,
+      titles,
+      record,
+      orcaSessionId,
+      matchedId: resolvedProcess.matchedId,
+      rowId
+    })
 
     return {
       workspaceId: workspace.id,
       workspaceName: workspace.name,
       workspaceKind: workspace.kind,
-      terminalId: agent.terminalId,
+      terminalId: null,
       title,
       agent: kind,
       state: agent.state,
+      stateKnown: true,
       stateStartedAt: agent.stateStartedAt,
       sessionId: rowId,
-      process,
-      matchedId,
-      pairing: matchedId ? ('id' as const) : pair ? ('agent' as const) : null,
-      matchedPid: pair?.pid ?? null,
-      matchedPgid: pair?.pgid ?? null,
-      processNote
+      orcaSessionId,
+      memoryBytes: memEntry?.chat.memory ?? null,
+      process: resolvedProcess.process,
+      matchedId: resolvedProcess.matchedId,
+      pairing: resolvedProcess.pairing,
+      matchedPid: resolvedProcess.matchedPid,
+      matchedPgid: resolvedProcess.matchedPgid,
+      processNote: resolvedProcess.processNote
     }
   })
+
+  // Any active chat reported by `orca diagnostics memory` that `agents.list` omitted (e.g.
+  // workspace truncated, hidden, or `agents.list` failed/capped) is appended so the list matches
+  // Orca's Resource Manager 1:1. Close stays disabled because its idle state is unknown.
+  for (const [agentSessionId, { chat, workspace }] of memoryChatsById) {
+    if (seenCanonicalChatIds.has(agentSessionId)) continue
+    const recordLookup = recordsLoaded
+      ? findSessionRecord(records, agentSessionId, workspace.id, workspace.path)
+      : ({ status: 'not_found' } as const)
+    const record = recordLookup.status === 'found' ? recordLookup.record : null
+    const kind =
+      chat.agent && chat.agent !== 'unknown' ? chat.agent : (record?.provider ?? 'unknown')
+    const candidates = recordsLoaded
+      ? sessionCandidates(records, agentSessionId, workspace.id, workspace.path)
+      : [agentSessionId]
+    const resolvedProcess = resolveChatProcess({
+      kind,
+      rowId: agentSessionId,
+      candidates,
+      recordLookup,
+      recordsLoaded,
+      recordsError,
+      processTable,
+      psError,
+      ownPgid,
+      inMemorySnapshot: true
+    })
+    const stateHint = '未从 Orca 获取到会话空闲状态，暂不可关闭'
+    const processNote = resolvedProcess.processNote
+      ? `${resolvedProcess.processNote}；${stateHint}`
+      : stateHint
+
+    sessions.push({
+      workspaceId: workspace.id,
+      workspaceName: workspace.name,
+      workspaceKind: workspace.kind,
+      terminalId: null,
+      title: resolveChatTitle({
+        memoryName: chat.name,
+        titles,
+        record,
+        orcaSessionId: agentSessionId,
+        matchedId: resolvedProcess.matchedId,
+        rowId: agentSessionId
+      }),
+      agent: kind,
+      state: 'working',
+      stateKnown: false,
+      stateStartedAt: 0,
+      sessionId: agentSessionId,
+      orcaSessionId: agentSessionId,
+      memoryBytes: chat.memory,
+      process: resolvedProcess.process,
+      matchedId: resolvedProcess.matchedId,
+      pairing: resolvedProcess.pairing,
+      matchedPid: resolvedProcess.matchedPid,
+      matchedPgid: resolvedProcess.matchedPgid,
+      processNote
+    })
+  }
 
   let recentOps: OpRecord[] = []
   try {
@@ -412,14 +762,29 @@ type CloseInput = {
   workspaceId: string
   sessionId?: string | null
   terminalId?: string | null
-  /** The pid an id-less agent's row was paired to; absent for id matches. */
+  /** Expected lease pid from the row; re-verified against `agent_session_records` and `ps lstart`. */
   pid?: number | null
   dryRun?: boolean
 }
 
+function findAgentMatch(
+  agents: readonly ListedAgent[],
+  input: CloseInput,
+  records: readonly SessionRecord[]
+): ListedAgent | undefined {
+  const direct = agents.find(
+    (agent) =>
+      (input.sessionId != null && agent.sessionId === input.sessionId) ||
+      (input.terminalId != null && agent.terminalId === input.terminalId)
+  )
+  if (direct || input.sessionId == null) return direct
+  const candidates = new Set(sessionCandidates(records, input.sessionId, input.workspaceId))
+  return agents.find((agent) => agent.sessionId != null && candidates.has(agent.sessionId))
+}
+
 /**
  * Closes one session after checking, against a fresh `agents.list`, that it still exists and is
- * `done`. A session that started working again is refused here, not just in the panel.
+ * `done`, then verifying its live lease and `ps` `lstart` before signalling.
  */
 async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOutcome> {
   const dryRun = input.dryRun === true
@@ -431,7 +796,7 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
     dryRun
   }
   const fallbackTitle = input.sessionId
-    ? idLabel(input.sessionId)
+    ? safeIdLabel(input.sessionId)
     : (input.terminalId ?? '会话')
   const fallbackKind: 'terminal' | 'signal' = input.terminalId ? 'terminal' : 'signal'
 
@@ -453,7 +818,7 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
     return outcome
   }
 
-  let agents
+  let agents: ListedAgent[]
   try {
     ;({ agents } = await orca.host.call('agents.list', { workspaceId: input.workspaceId }))
   } catch (error) {
@@ -463,17 +828,27 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
     )
   }
 
-  const match = agents.find(
-    (agent) =>
-      (input.sessionId != null && agent.sessionId === input.sessionId) ||
-      (input.terminalId != null && agent.terminalId === input.terminalId)
-  )
+  let match = findAgentMatch(agents, input, [])
+  let preloadedRecord: SessionRecord | null = null
+  if (!match && input.sessionId != null) {
+    const records = await signalOperations()
+      .listSessionRecords()
+      .catch(() => [] as SessionRecord[])
+    match = findAgentMatch(agents, input, records)
+    const lookup = findSessionRecord(records, input.sessionId, input.workspaceId)
+    if (lookup.status === 'found') preloadedRecord = lookup.record
+  }
+
   if (!match) {
     return finish({ ...base, code: 'not_found', message: '这个会话已经不在了，刷新看看' }, fallbackTitle)
   }
 
   const sessionId = match.sessionId ?? base.sessionId
-  const title = match.terminalId !== null ? terminalLabel(match) : idLabel(sessionId)
+  const title =
+    match.terminalId !== null
+      ? terminalLabel(match)
+      : preloadedRecord?.conversationName ?? safeIdLabel(preloadedRecord?.sessionId ?? sessionId)
+
   if (match.state !== 'done') {
     return finish(
       {
@@ -505,62 +880,17 @@ async function closeOne(orca: OrcaWorkerApi, input: CloseInput): Promise<CloseOu
     )
   }
 
-  if (!sessionId) {
+  const lookupId = sessionId ?? input.sessionId ?? null
+  if (!lookupId) {
     return finish({ ...base, code: 'no_handle', message: '这个会话既没有终端也没有 sessionId，没法关' }, title)
   }
 
-  const pid = typeof input.pid === 'number' ? input.pid : null
-  if (pid !== null) {
-    // The panel offers a pid only for an agent that carries no session id. Re-read the same
-    // pairing it drew before signalling: a changed per-workspace count, a different pid, or a
-    // process whose cwd left the workspace is refused, because an id-less pairing is a
-    // directory-and-count inference and may not outlive the snapshot that made it.
-    const snapshot = await readSnapshot(orca, false)
-    const row = snapshot.sessions.find(
-      (session) =>
-        session.workspaceId === input.workspaceId &&
-        session.terminalId === null &&
-        session.sessionId === sessionId
-    )
-    if (!row || row.pairing !== 'agent' || row.matchedPid !== pid) {
-      return finish(
-        {
-          ...base,
-          sessionId,
-          code: 'pairing_changed',
-          message: '这个会话和进程的配对已经变了（数量不再一一对应，或进程 cwd 已不在这个工作区），刷新确认后再关，不盲杀'
-        },
-        title
-      )
-    }
-    if (row.state !== 'done') {
-      return finish(
-        {
-          ...base,
-          sessionId,
-          code: 'not_idle',
-          message: `会话现在是「${AGENT_STATE_LABEL[row.state]}」，只有 done 才能关闭`
-        },
-        title
-      )
-    }
-    const workspacePath =
-      snapshot.workspaces.find((workspace) => workspace.id === input.workspaceId)?.path ?? null
-    const outcome = await stopPairedSession({
-      workspaceId: input.workspaceId,
-      sessionId,
-      agent: row.agent,
-      pid,
-      workspacePath,
-      dryRun,
-      ops: signalOperations()
-    })
-    return finish(outcome, title)
-  }
-
-  const outcome = await stopSessionWithSignal({
+  const expectedPid = typeof input.pid === 'number' ? input.pid : null
+  const outcome = await stopSessionByLease({
     workspaceId: input.workspaceId,
-    sessionId,
+    sessionId: lookupId,
+    expectedAgent: match.agent ?? null,
+    expectedPid,
     dryRun,
     ops: signalOperations()
   })
@@ -577,9 +907,9 @@ async function reclaimIdle(orca: OrcaWorkerApi, workspaceId: string, dryRun: boo
   for (const session of idle) {
     const outcome = await closeOne(orca, {
       workspaceId,
-      sessionId: session.sessionId,
+      sessionId: session.sessionId ?? session.orcaSessionId,
       terminalId: session.terminalId,
-      pid: session.pairing === 'agent' ? session.matchedPid : null,
+      pid: session.pairing === 'lease' ? session.matchedPid : null,
       dryRun
     })
     outcomes.push(outcome)

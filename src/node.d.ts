@@ -4,7 +4,7 @@ declare module 'node:child_process' {
   export function execFile(
     file: string,
     args: readonly string[],
-    options: { maxBuffer?: number },
+    options: { maxBuffer?: number; env?: Record<string, string | undefined> },
     callback: (error: Error | null, stdout: string, stderr: string) => void
   ): unknown
 }
@@ -19,5 +19,6 @@ declare module 'node:path' {
 
 declare const process: {
   readonly pid: number
+  readonly env: Record<string, string | undefined>
   kill(pid: number, signal?: string | number): boolean
 }
